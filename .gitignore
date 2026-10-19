@@ -1,0 +1,16 @@
+# Built binary
+txtreader.exe
+
+# State / runtime data
+*.state.json
+
+# Test artifacts
+*.txt
+*.log
+
+# Go cache (keep go.mod/go.sum)
+vendor/
+
+# OS junk
+.DS_Store
+Thumbs.db

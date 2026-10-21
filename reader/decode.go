@@ -183,12 +183,15 @@ func (b *Book) Next() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if isEOF && s == "" { // 恰好停在页边界：后面没有内容了
+		cs := clean(s)
+		if isEOF && cs == "" { // 页边界或只剩空白/控制符：后面没有可见内容了
+			// （先 clean 再判空：结尾恰是 \r\n/零宽符时旧逻辑会缓存一个空页，
+			//   累积阅读里多出一段无意义空白）
 			b.eof = true
 			return b.cache[b.cur], nil
 		}
 		b.eof = isEOF
-		b.cache[b.cur+1] = clean(s)
+		b.cache[b.cur+1] = cs
 		b.cur++
 		b.readerUp = b.cur + 1
 		b.prune()
@@ -463,7 +466,7 @@ func clean(s string) string {
 	out := b.String()
 	out = strings.ReplaceAll(out, "\r\n", "\n")
 	out = strings.ReplaceAll(out, "\r", "\n")
-	out = reTrailingWS.ReplaceAllString(out, "\n")  // 行尾去空白
+	out = reTrailingWS.ReplaceAllString(out, "\n")   // 行尾去空白
 	out = reBlankLines.ReplaceAllString(out, "\n\n") // 合并连续空行
 	out = strings.TrimSpace(out)                     // 去除首尾空行
 	return out

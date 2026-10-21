@@ -3,6 +3,7 @@ package reader
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -57,36 +58,55 @@ func TestBuildTOC(t *testing.T) {
 func TestIsChapterTitle(t *testing.T) {
 	cases := map[string]bool{
 		"第一章 风云初起":           true,
-		"第12章 终局":              true,
-		"第百回 大战":              true,
-		"序":                     true,
-		"后记":                    true,
-		"楔子":                    true,
-		"Chapter 3 The End":      true,
-		"SECTION 2 overview":     true,
-		"# 标题":                  true,
-		"## 二级标题":              true,
+		"第12章 终局":            true,
+		"第百回 大战":             true,
+		"序":                  true,
+		"后记":                 true,
+		"楔子":                 true,
+		"Chapter 3 The End":  true,
+		"SECTION 2 overview": true,
+		"# 标题":               true,
+		"## 二级标题":            true,
 		// 数字/中文数字类章节分割
-		"一":                     true,
-		"1":                     true,
-		"十二":                   true,
-		"007":                   true,
-		"一、风波暗涌":             true,
-		"1. 起点":                true,
-		"12、风云突变":            true,
-		"（一）":                  true,
-		"(2)":                   true,
-		"12 风波":                true,
+		"一":       true,
+		"1":       true,
+		"十二":      true,
+		"007":     true,
+		"一、风波暗涌":  true,
+		"1. 起点":   true,
+		"12、风云突变": true,
+		"（一）":     true,
+		"(2)":     true,
+		"12 风波":   true,
 		// 反例保护
-		"2008年大事记":            false, // 4 位数字且无分隔符
-		"3个人走在路上":             false, // 数字后无空格/分隔符
-		"a":                     false, // 太短且非关键词/数字
-		"正文内容继续写下去没有章节特征":     false, // 无模式
+		"2008年大事记": false, // 4 位数字且无分隔符
+		"3个人走在路上":  false, // 数字后无空格/分隔符
+		"a":        false, // 太短且非关键词/数字
+		"正文内容继续写下去没有章节特征": false, // 无模式
 		"这是一段普通正文不应被识别为章节因为太长太长太长太长太长太长太长太长太长太长太长太长太长太长太长太长太长太长": false, // 超长
 	}
 	for in, want := range cases {
 		if got := isChapterTitle(in); got != want {
 			t.Errorf("isChapterTitle(%q)=%v, want %v", in, got, want)
 		}
+	}
+}
+
+// TestChapterTitleKeywordCap B4 回归：关键词前缀匹配必须有 40 字上限，
+// 否则正文段落（以"前言/附录"起头的长句）会被灌进目录。
+func TestChapterTitleKeywordCap(t *testing.T) {
+	long := "前言往事如烟，这一段的正文非常长，" + strings.Repeat("内容", 60)
+	if isChapterTitle(long) {
+		t.Errorf("%d 字正文段不应被判为章节标题", len([]rune(long)))
+	}
+	long2 := "附录里他还提到，" + strings.Repeat("字", 100)
+	if isChapterTitle(long2) {
+		t.Errorf("100+ 字正文不应因「附录」前缀成目录项")
+	}
+	if !isChapterTitle("前言") {
+		t.Error("短关键词行仍应识别")
+	}
+	if !isChapterTitle("楔子") {
+		t.Error("短关键词行仍应识别")
 	}
 }

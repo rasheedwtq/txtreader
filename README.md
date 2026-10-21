@@ -7,7 +7,7 @@
 - 支持 `.txt` / `.md` 文件阅读
 - Markdown 美化渲染（标题、列表、代码块等）
 - 目录跳转（TOC 自动提取）
-- 拼音首字母快速定位
+- 拼音首字母快速定位（中文按拼音，英文按字母，书名号等前导标点不参与排序）
 - 行间距调节（紧凑 / 标准 / 宽松 / 超宽）
 - 字体大小调节
 - 无限滚动加载
@@ -71,9 +71,14 @@ txtreader/
 
 ## 开发
 
-测试：
-
 ```powershell
+# 构建
+go build -ldflags="-H windowsgui -s -w" -o txtreader.exe
+
+# 测试（需设置 GOPATH）
+set GOROOT=D:\project\txt\go_pkg\go
+set GOPATH=D:\project\txt\gopath
+set GOMODCACHE=%GOPATH%\pkg\mod
 go test ./...
 ```
 

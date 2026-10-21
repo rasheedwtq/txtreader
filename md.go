@@ -12,19 +12,70 @@ import (
 
 var (
 	reMDHead = regexp.MustCompile(`^(#{1,6})\s+(.*)$`)
-	reMDHr   = regexp.MustCompile(`^\s*(-{3,}|\*{3,}|_{3,})\s*$`)
-	reMDBold = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
-	reMDCode = regexp.MustCompile("`([^`\n]+)`")
+	// 闭合式 ATX 尾缀：`## 标题 ##` 的尾部 ` ##`（CommonMark 要求 # 前有空白，
+	// "C#" 这类正文不会被误剥）。
+	reMDATXClose = regexp.MustCompile(`\s+#+\s*$`)
+	reMDHr       = regexp.MustCompile(`^\s*(-{3,}|\*{3,}|_{3,})\s*$`)
+	reMDBold     = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
+	reMDCode     = regexp.MustCompile("`([^`\n]+)`")
 )
 
 // mdBeautify 逐行转换 + 表格块对齐重排（行数不变）。
+// 围栏代码块（``` / ~~~）内逐字保留：块里的 #、>、** 是代码不是排版，
+// 误美化会把注释行缩进成假标题。围栏开/闭行本身也原样保留。
 func mdBeautify(s string) string {
 	lines := strings.Split(s, "\n")
+	fenced := make([]bool, len(lines)) // 该行是否处于围栏内（含围栏行本身）
+	inFence := false
+	var fenceMarker rune
+	fenceLen := 0
 	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if m, n, ok := mdFence(t); ok {
+			if !inFence {
+				inFence, fenceMarker, fenceLen = true, m, n
+				fenced[i] = true
+				continue
+			}
+			// 闭栏：同一字符、不短于开栏、行内只有该字符（闭栏不允许 info string）
+			if m == fenceMarker && n >= fenceLen && strings.Trim(t, string(m)) == "" {
+				inFence = false
+				fenced[i] = true
+				continue
+			}
+		}
+		if inFence {
+			fenced[i] = true
+			continue
+		}
 		lines[i] = mdLine(ln)
 	}
-	alignTables(lines)
+	alignTables(lines, fenced)
 	return strings.Join(lines, "\n")
+}
+
+// mdFence 识别围栏行：0~3 空格缩进 + 至少 3 个 ` 或 ~（可带 info string）。
+func mdFence(t string) (marker rune, length int, ok bool) {
+	t = strings.TrimLeft(t, " ")
+	if len(t) < 3 {
+		return 0, 0, false
+	}
+	c := t[0]
+	if c != '`' && c != '~' {
+		return 0, 0, false
+	}
+	n := 0
+	for n < len(t) && t[n] == c {
+		n++
+	}
+	if n < 3 {
+		return 0, 0, false
+	}
+	rest := strings.TrimSpace(t[n:])
+	if c == '`' && strings.ContainsRune(rest, '`') {
+		return 0, 0, false // ` 的 info string 内不允许反引号
+	}
+	return rune(c), n, true
 }
 
 // mdLine 单行转换：层级用【缩进】表达，不发明符号（大叔审美：改格式，不替换字符）。
@@ -38,21 +89,23 @@ func mdLine(ln string) string {
 	if strings.HasPrefix(t, "|") {
 		return ln
 	}
-	// ATX 标题：去 # 前缀，按层级缩进（H1 顶格、H2 缩 2 格、H3 缩 4 格…）
+	// ATX 标题：去 # 前缀，按层级缩进（H1 顶格、H2 缩 2 格、H3 缩 4 格…）；
+	// 标题内的粗体/行内代码标记同样剥离
 	if m := reMDHead.FindStringSubmatch(t); m != nil {
 		lvl := len(m[1])
-		return strings.Repeat("  ", lvl-1) + strings.TrimSpace(m[2])
+		body := strings.TrimSpace(m[2])
+		body = reMDATXClose.ReplaceAllString(body, "") // 闭合式 ATX 尾部 ## 剥离
+		body = reMDBold.ReplaceAllString(body, "$1")
+		body = reMDCode.ReplaceAllString(body, "$1")
+		return strings.Repeat("  ", lvl-1) + body
 	}
 	// 分隔线 --- *** ___ 原样保留
-	// 引用 >：去掉符号，按嵌套层数缩进（每层 4 格）
+	// 引用 >：去掉符号，按嵌套层数缩进（每层 4 格）。
+	// 层数 = 前导「> 与空格」混合序列里 > 的个数，"> > x" 与 ">> x" 都算两层。
 	if strings.HasPrefix(t, ">") {
-		gt := strings.IndexFunc(t, func(r rune) bool { return r != '>' })
-		n := gt
-		if gt < 0 {
-			n = len(t)
-		}
-		body := strings.TrimSpace(strings.TrimLeft(t, "> "))
-		return strings.Repeat("    ", n) + body
+		body := strings.TrimLeft(t, "> ")
+		n := strings.Count(t[:len(t)-len(body)], ">")
+		return strings.Repeat("    ", n) + strings.TrimSpace(body)
 	}
 	// 无序列表：原样保留（- / * / + 是通用列表符）
 	// 行内：粗体/行内代码去标记（删字符而非换字符）
@@ -93,7 +146,10 @@ func parseCells(ln string) []string {
 	parts := strings.Split(t, "|")
 	cells := make([]string, len(parts))
 	for i, c := range parts {
-		cells[i] = strings.TrimSpace(c)
+		c = strings.TrimSpace(c)
+		c = reMDBold.ReplaceAllString(c, "$1") // 单元格内粗体/代码标记同样剥离
+		c = reMDCode.ReplaceAllString(c, "$1")
+		cells[i] = c
 	}
 	return cells
 }
@@ -110,14 +166,15 @@ func isSepRow(cells []string) bool {
 }
 
 // alignTables 扫描连续表格块（| 开头 | 结尾的行），按列宽对齐重排（行数不变）。
-func alignTables(lines []string) {
+// fenced 标记围栏内的行（含围栏行），不参与表格识别——代码块里的 |...| 不是表格。
+func alignTables(lines []string, fenced []bool) {
 	for i := 0; i < len(lines); {
-		if !isTableLine(lines[i]) {
+		if fenced[i] || !isTableLine(lines[i]) {
 			i++
 			continue
 		}
 		j := i
-		for j < len(lines) && isTableLine(lines[j]) {
+		for j < len(lines) && !fenced[j] && isTableLine(lines[j]) {
 			j++
 		}
 		rows := lines[i:j]

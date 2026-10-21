@@ -18,7 +18,7 @@ const (
 
 // shfileopstructW 对应 Windows SHFileOperationW 的 SHFILEOPSTRUCTW（64 位布局）。
 type shfileopstructW struct {
-	hwnd                   uintptr
+	hwnd                  uintptr
 	wFunc                 uint32
 	pFrom                 *uint16
 	pTo                   *uint16

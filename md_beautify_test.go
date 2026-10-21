@@ -35,12 +35,12 @@ func TestMdBeautify(t *testing.T) {
 		t.Fatalf("行数必须 1:1（TOC 定位依赖）：in=%d out=%d", inLines, outLines)
 	}
 	want := []string{
-		"书名",           // H1 顶格
-		"  章节标题",        // H2 缩 2
-		"    小节",         // H3 缩 4
-		"- 项目甲",          // 列表原样保留
+		"书名",     // H1 顶格
+		"  章节标题", // H2 缩 2
+		"    小节", // H3 缩 4
+		"- 项目甲",  // 列表原样保留
 		"- 项目乙",
-		"    引用句子",       // 引用按层缩进
+		"    引用句子",   // 引用按层缩进
 		"这是加粗和代码混排。", // 粗体/代码去标记
 	}
 	for _, w := range want {
@@ -93,5 +93,77 @@ func TestMdBeautifyPlainText(t *testing.T) {
 	out := displayText(in)
 	if !strings.Contains(out, "# 不是md") {
 		t.Error("txt 模式下 # 应原样保留")
+	}
+}
+
+// TestMdQuoteNestingHeadingBold B5/B6 回归："> > x" 两层缩进 8 格；
+// 标题与表格单元格内的粗体/代码标记同样剥离。
+func TestMdQuoteNestingHeadingBold(t *testing.T) {
+	if got := mdLine("> > 深层引用"); got != "        深层引用" {
+		t.Errorf("两层引用应缩 8 格，got %q", got)
+	}
+	if got := mdLine(">> 两层"); got != "        两层" {
+		t.Errorf(">> 两层应缩 8 格，got %q", got)
+	}
+	if got := mdLine("> 一层"); got != "    一层" {
+		t.Errorf("一层引用应缩 4 格，got %q", got)
+	}
+	if got := mdLine("## **重要章节**"); got != "  重要章节" {
+		t.Errorf("标题内粗体标记应剥离，got %q", got)
+	}
+	out := mdBeautify("| A | B |\n|---|---|\n| **粗** | `码` |\n")
+	if strings.Contains(out, "**") || strings.Contains(out, "`") {
+		t.Errorf("表格单元格内标记应剥离；输出：\n%s", out)
+	}
+}
+
+// TestMdFenceCodeBlock N-C 回归：围栏代码块内逐字保留（#/>,** 都是代码不是排版）；
+// 闭合式 ATX `## 关 ##` 尾部 ## 剥离；"C#" 不被误剥；行数 1:1。
+func TestMdFenceCodeBlock(t *testing.T) {
+	in := "# 标题\n" +
+		"```go\n" +
+		"# 注释不是标题\n" +
+		"**不加粗**\n" +
+		"```\n" +
+		"## 关 ##\n" +
+		"## C# 实战\n" +
+		"尾行\n"
+	out := mdBeautify(in)
+
+	if strings.Count(out, "\n") != strings.Count(in, "\n") {
+		t.Fatalf("行数必须 1:1：in=%d out=%d", strings.Count(in, "\n"), strings.Count(out, "\n"))
+	}
+	got := strings.Split(out, "\n")
+	want := []string{
+		"标题",
+		"```go",
+		"# 注释不是标题", // 围栏内原样
+		"**不加粗**",
+		"```",
+		"  关",     // 闭合式 ATX 尾部 ## 剥离
+		"  C# 实战", // 正文里的 # 不误剥
+		"尾行",
+		"",
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("第 %d 行 got %q, want %q；全输出：\n%s", i, got[i], w, out)
+		}
+	}
+}
+
+// TestMdFencedTableNotAligned N-C 回归：围栏内的 |...| 行是代码不是表格，不做对齐重排。
+func TestMdFencedTableNotAligned(t *testing.T) {
+	in := "```text\n" +
+		"| a | b |\n" +
+		"|---|---|\n" +
+		"```\n"
+	out := mdBeautify(in)
+	if strings.Contains(out, "|---|") && strings.Count(out, "|---|---|") != 1 {
+		// 重排会把分隔行变成 |----|----|（列宽+2）；原样保留则仍是 |---|---|
+		t.Errorf("围栏内表格不应被重排；输出：\n%s", out)
+	}
+	if !strings.Contains(out, "| a | b |") {
+		t.Errorf("围栏内内容应逐字保留；输出：\n%s", out)
 	}
 }

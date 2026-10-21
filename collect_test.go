@@ -23,9 +23,25 @@ func TestCollectTxtMany(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ents := collectTxt(dir)
+	ents, err := collectTxt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(ents) != n {
 		t.Fatalf("collectTxt 返回 %d 个，want %d（txt+md 混合）", len(ents), n)
+	}
+}
+
+// TestCollectTxtDirError 回归（2026-10-21 卫生项 2）：目录读失败必须报错，
+// 不能与"目录里真没书"一样返回空列表（否则 UI 会显示"无文档"，用户以为书没了）。
+func TestCollectTxtDirError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "不存在的目录")
+	ents, err := collectTxt(missing)
+	if err == nil {
+		t.Fatal("目录不存在时应返回 error")
+	}
+	if ents != nil {
+		t.Errorf("失败时应返回 nil 列表，got %v", ents)
 	}
 }
 
@@ -46,7 +62,10 @@ func TestCollectNoRecurse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ents := collectTxt(dir)
+	ents, err := collectTxt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(ents) != 4 {
 		t.Fatalf("应收当前层 4 篇（3 txt + 1 md；不递归子目录、不收 pdf/epub/mobi），got %d：%v", len(ents), ents)
 	}
@@ -76,7 +95,10 @@ func TestRealGuanchangPinyinSort(t *testing.T) {
 	if _, err := os.Stat(dir); err != nil {
 		t.Skip("官场目录不存在，跳过")
 	}
-	ents := collectTxt(dir)
+	ents, err := collectTxt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(ents) == 0 {
 		t.Fatal("collectTxt 返回空")
 	}
@@ -87,5 +109,40 @@ func TestRealGuanchangPinyinSort(t *testing.T) {
 	}
 	if strings.Contains(last, "龙城") {
 		t.Fatalf("龙城仍是最后一个（拼音排序未生效），last=%q", last)
+	}
+}
+
+// TestPinyinKeyKeepsNonChinese B3 回归：自定义 Fallback 后非汉字原样保留，
+// 英文/数字前缀不再被丢弃导致同键排序退化。
+func TestPinyinKeyKeepsNonChinese(t *testing.T) {
+	if got := pinyinKey("hello.txt"); got != "hello.txt" {
+		t.Errorf("pinyinKey(hello.txt)=%q, want \"hello.txt\"", got)
+	}
+	if pinyinKey("A文件.txt") == pinyinKey("Z文件.txt") {
+		t.Error("英文前缀应参与排序键，A文件/Z文件 不应同键")
+	}
+	if got := pinyinKey("2008年.txt"); got != "2008nian.txt" {
+		t.Errorf("pinyinKey(2008年.txt)=%q, want \"2008nian.txt\"", got)
+	}
+	if got := pinyinKey("龙城.txt"); got != "longcheng.txt" {
+		t.Errorf("pinyinKey(龙城.txt)=%q, want \"longcheng.txt\"", got)
+	}
+}
+
+// TestPinyinBracketSort N-A 回归：前导标点（书名号《等）不参与排序键，
+// 《三国演义》按"三国演义"归位、与同拼音普通书名相邻，而不是沉到全列表底部。
+func TestPinyinBracketSort(t *testing.T) {
+	if !strings.HasPrefix(pinyinSortKey("《三国演义》.txt"), "sang") {
+		t.Errorf("书名号应被剥离再转拼音，key=%q", pinyinSortKey("《三国演义》.txt"))
+	}
+	names := []string{"zoo.txt", "《安魂曲》.txt", "曹操传.txt", "《曹操传》.txt"}
+	sort.Slice(names, func(i, j int) bool {
+		return pinyinSortKey(names[i]) < pinyinSortKey(names[j])
+	})
+	want := []string{"《安魂曲》.txt", "曹操传.txt", "《曹操传》.txt", "zoo.txt"}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("排序结果 %v，want %v（an < cao < zoo；书名号版紧邻普通版之后）", names, want)
+		}
 	}
 }

@@ -32,12 +32,12 @@ var (
 
 	// 数字/中文数字类章节分割（大叔经验：正文一般不会以数字开头，
 	// 以数字开头的短行大概率是章节标记；少量误判可容忍——宁多勿漏）。
-	reNumOnly   = regexp.MustCompile(`^[0-9]{1,4}$`)                                              // 1 / 12 / 007
-	reCNNumOnly = regexp.MustCompile(`^[零〇一二三四五六七八九十百千两]{1,6}$`)                          // 一 / 十二
-	reNumDot    = regexp.MustCompile(`^[0-9]{1,3}\s*[、.．]\s*\S`)                                 // 1. 起点 / 12、风云
-	reCNNumDot  = regexp.MustCompile(`^[零〇一二三四五六七八九十百千两]{1,3}\s*[、.．]\s*\S`)                 // 一、风波
-	reParen     = regexp.MustCompile(`^[（(]\s*[0-9零〇一二三四五六七八九十百千两]{1,3}\s*[)）]$`)              // （一） / (2)
-	reNumSpace  = regexp.MustCompile(`^[0-9]{1,3}\s+\S`)                                         // 12 风波（另限行长≤20）
+	reNumOnly   = regexp.MustCompile(`^[0-9]{1,4}$`)                              // 1 / 12 / 007
+	reCNNumOnly = regexp.MustCompile(`^[零〇一二三四五六七八九十百千两]{1,6}$`)                  // 一 / 十二
+	reNumDot    = regexp.MustCompile(`^[0-9]{1,3}\s*[、.．]\s*\S`)                  // 1. 起点 / 12、风云
+	reCNNumDot  = regexp.MustCompile(`^[零〇一二三四五六七八九十百千两]{1,3}\s*[、.．]\s*\S`)      // 一、风波
+	reParen     = regexp.MustCompile(`^[（(]\s*[0-9零〇一二三四五六七八九十百千两]{1,3}\s*[)）]$`) // （一） / (2)
+	reNumSpace  = regexp.MustCompile(`^[0-9]{1,3}\s+\S`)                          // 12 风波（另限行长≤20）
 )
 
 // isChapterTitle 综合识别章节标题。
@@ -48,8 +48,9 @@ func isChapterTitle(s string) bool {
 	if len(r) == 0 {
 		return false
 	}
-	// 短至 1 字也认：关键词类（序/后记/楔子…）+ 纯数字/纯中文数字/括号数字行
-	if reCNKeyword.MatchString(t) || reNumOnly.MatchString(t) || reCNNumOnly.MatchString(t) || reParen.MatchString(t) {
+	// 短至 1 字也认：关键词类（序/后记/楔子…）+ 纯数字/纯中文数字/括号数字行。
+	// 关键词是前缀匹配，必须限 40 字上限：否则正文段落"前言往事如烟…"会被灌进目录。
+	if len(r) <= 40 && (reCNKeyword.MatchString(t) || reNumOnly.MatchString(t) || reCNNumOnly.MatchString(t) || reParen.MatchString(t)) {
 		return true
 	}
 	if len(r) < 2 || len(r) > 40 {
@@ -118,6 +119,11 @@ func (b *Book) BuildTOC() ([]TocEntry, error) {
 
 // SeekTo 跳到全局 rune 偏移 offset 所在页，并在该页（clean 后）文本中定位 title，
 // 返回页文本与 title 的页内 rune 偏移。用于章级精确定位（含同页多章节分别定位）。
+//
+// 边界情形：标题行可能横跨页边界（标题行本身有十几字，页边界落在行中间），
+// 此时整串标题不在任何单页里，strings.Index 必然 -1。退化策略：
+// 取标题的最长前缀在页尾附近找落点（被切断时前半段必在页尾），
+// 至少保证"跳到标题开头"而不是退化为页首。
 func (b *Book) SeekTo(offset int, title string) (string, int, error) {
 	if offset < 0 {
 		offset = 0
@@ -128,8 +134,34 @@ func (b *Book) SeekTo(offset int, title string) (string, int, error) {
 	}
 	txt := b.cache[page]
 	bi := strings.Index(txt, title)
-	if bi < 0 {
-		return txt, 0, nil // 标题未在页内找到（极端），退化为页首
+	if bi >= 0 {
+		return txt, len([]rune(txt[:bi])), nil
 	}
-	return txt, len([]rune(txt[:bi])), nil
+	if off, ok := findSplitTitle(txt, title); ok {
+		return txt, off, nil
+	}
+	return txt, 0, nil // 标题未在页内找到（极端），退化为页首
+}
+
+// findSplitTitle 标题被页边界切断时的落点定位：在页尾 window 个 rune 内，
+// 找标题最长前缀的最后一次出现，返回其在页内的 rune 偏移。
+func findSplitTitle(pageText, title string) (int, bool) {
+	const window = 400
+	rs := []rune(pageText)
+	ts := []rune(title)
+	if len(ts) < 2 || len(rs) < 2 {
+		return 0, false
+	}
+	start := len(rs) - window
+	if start < 0 {
+		start = 0
+	}
+	tail := string(rs[start:])
+	for n := len(ts); n >= 2; n-- {
+		i := strings.LastIndex(tail, string(ts[:n]))
+		if i >= 0 {
+			return start + len([]rune(tail[:i])), true
+		}
+	}
+	return 0, false
 }

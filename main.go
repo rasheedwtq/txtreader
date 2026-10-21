@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unsafe"
 
 	"github.com/lxn/walk"
@@ -41,14 +42,20 @@ var (
 	readerFont *walk.Font
 	curIsMD    bool // 当前打开的是 .md 文件（显示层走 md 美化）
 
-	tocLB     *walk.ListBox // 右侧章节目录栏（有目录时显示，无则隐藏）
-	curTOC    []reader.TocEntry
+	tocLB      *walk.ListBox // 右侧章节目录栏（有目录时显示，无则隐藏）
+	curTOC     []reader.TocEntry
 	tocLoading bool // SetModel 期间屏蔽 OnCurrentIndexChanged 误跳
-	hs        *walk.Splitter
+	hs         *walk.Splitter
 )
 
 // pyArgs 拼音转换参数（默认风格，多音字取第一个读音）。
-var pyArgs = pinyin.NewArgs()
+// Fallback 必须自定义：go-pinyin 默认忽略无拼音字符（实测 "hello.txt" 键为空、
+// "A文件"/"Z文件" 同键，排序退化），这里让非汉字原样保留，英文/数字走字母序。
+var pyArgs = func() pinyin.Args {
+	a := pinyin.NewArgs()
+	a.Fallback = func(r rune, _ pinyin.Args) []string { return []string{string(r)} }
+	return a
+}()
 
 // pinyinKey 返回拼音排序键：汉字转拼音字母（多音字取首读音），非汉字原样保留，
 // 整体转小写。使中文按拼音、英文按字母统一排序（符合中文用户习惯）。
@@ -63,13 +70,29 @@ func pinyinKey(s string) string {
 	return strings.ToLower(sb.String())
 }
 
+// pinyinSortKey 排序总键：先剥离前导标点再转拼音，末尾 \x00+原名 兜底。
+// 前导标点（书名号《、引号「“、括号【等）不参与排序——否则《开头的键首字节
+// 0xE3 大于所有字母/数字，书名号文件会整体沉底（探针实证：《三国演义》排在
+// zoo.txt 之后）。剥离后《三国演义》按"三国演义"归位，与同拼音普通书名相邻。
+func pinyinSortKey(s string) string {
+	body := strings.TrimLeftFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	if body == "" {
+		body = s // 纯标点文件名：退回原名，避免空键
+	}
+	return pinyinKey(body) + "\x00" + s
+}
+
 // collectTxt 读取目录【当前层】的所有 .txt/.md（不递归子目录），按拼音排序。
 // 只读当前层：书库按层级组织（中国/小说/作者），一次只列当前层，子目录用"打开文件夹"进；
 // 既符合按层级逐层看的习惯，也避免机械盘递归大分区时冷读 IO 卡数秒。
-func collectTxt(dir string) []entry {
+// 目录读失败（权限/盘符未挂载）必须与"目录里真没书"区分开——原实现两者都返回空列表，
+// 用户会以为书没了。
+func collectTxt(dir string) ([]entry, error) {
 	des, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var ents []entry
 	for _, de := range des {
@@ -84,14 +107,15 @@ func collectTxt(dir string) []entry {
 	}
 
 	// 拼音排序：中文转拼音字母（组织部长 zuzhi 排龙城 longcheng 之后，生僻字也准），
-	// 英文/数字走字母序。取代旧的 Unicode 码点序（会把"龙"U+9F99 误排到最后）。
+	// 英文/数字走字母序，书名号等前导标点不参与（见 pinyinSortKey）。
+	// 取代旧的 Unicode 码点序（会把"龙"U+9F99 误排到最后）。
 	type keyed struct {
 		e entry
 		k string
 	}
 	ks := make([]keyed, len(ents))
 	for i, e := range ents {
-		ks[i] = keyed{e: e, k: pinyinKey(e.name)}
+		ks[i] = keyed{e: e, k: pinyinSortKey(e.name)}
 	}
 	sort.Slice(ks, func(i, j int) bool {
 		return ks[i].k < ks[j].k
@@ -99,7 +123,7 @@ func collectTxt(dir string) []entry {
 	for i := range ks {
 		ents[i] = ks[i].e
 	}
-	return ents
+	return ents, nil
 }
 
 func names() []string {
@@ -122,6 +146,7 @@ func disp(s string) string {
 //   - 标准(1)：完全保持（与旧行为一致，中文观感不变）
 //   - 宽松(2)：段间 2 空行、段内行后 1 空行
 //   - 超宽(3)：段间 3 空行、段内行后 2 空行
+//
 // 关键：英文硬换行文本段落之间往往没有 \n\n（只有孤立单 \n），旧实现只认 \n\n，
 // 导致英文行距无效；本实现同时作用于孤立单 \n，英文段内行间也能拉开。
 // 用占位符 paraSep 先把段间 \n\n 隔离，再分别处理，避免两类换行互相干扰。
@@ -137,13 +162,13 @@ func applySpacing(s string) string {
 	tmp := strings.ReplaceAll(s, "\n\n", paraSep)
 	var lineGap, paraGap string
 	if curSpacing == 2 {
-		lineGap = "\n\n"     // 段内行后 +1 空行
-		paraGap = "\n\n\n"   // 段间 2 空行
+		lineGap = "\n\n"   // 段内行后 +1 空行
+		paraGap = "\n\n\n" // 段间 2 空行
 	} else {
 		lineGap = "\n\n\n"   // 段内行后 +2 空行
 		paraGap = "\n\n\n\n" // 段间 3 空行
 	}
-	tmp = strings.ReplaceAll(tmp, "\n", lineGap)   // 段内孤立 \n 加行距
+	tmp = strings.ReplaceAll(tmp, "\n", lineGap)    // 段内孤立 \n 加行距
 	tmp = strings.ReplaceAll(tmp, paraSep, paraGap) // 段间 \n\n 加行距
 	return tmp
 }
@@ -244,7 +269,9 @@ func restoreState() {
 	if st.FontSize > 0 {
 		curSize = st.FontSize
 	}
-	curSpacing = st.LineSpacing
+	if st.LineSpacing >= 0 && st.LineSpacing <= 3 {
+		curSpacing = st.LineSpacing // 越界脏值不采用（缺字段时为 0=紧凑，与旧版行为一致）
+	}
 	if f, e := walk.NewFont(curFamily, curSize, 0); e == nil {
 		readerFont = f
 	}
@@ -286,6 +313,7 @@ func pageFirst() {
 	}
 	if _, err := curBook.First(); err == nil {
 		startAccumFrom(0)
+		persist() // 跳转即落盘，异常退出不丢进度
 	}
 }
 
@@ -295,6 +323,7 @@ func pageLast() {
 	}
 	if _, err := curBook.Last(); err == nil {
 		startAccumFrom(curBook.Page())
+		persist()
 	}
 }
 
@@ -340,7 +369,20 @@ func refreshCurrent(selectIdx int) {
 	if curDir == "" {
 		return
 	}
-	curEntries = collectTxt(curDir)
+	ents, err := collectTxt(curDir)
+	if err != nil {
+		// 目录读失败：与"目录里没书"区分，别让用户以为书没了
+		curEntries = nil
+		_ = lb.SetModel([]string{})
+		if curBook != nil {
+			curBook.Close()
+			curBook = nil
+		}
+		te.SetText("")
+		folderLbl.SetText(fmt.Sprintf("文件夹：%s（读取失败：%v）", curDir, err))
+		return
+	}
+	curEntries = ents
 	_ = lb.SetModel(names())
 	if len(curEntries) == 0 {
 		if curBook != nil {
@@ -371,11 +413,25 @@ func refreshCurrent(selectIdx int) {
 		te.SetText("")
 	}
 	lb.SetCurrentIndex(0)
+	openAt(0) // 兜底：索引未变时事件不触发（如打开失败后 F5 重试），同路径判断防重复打开
 }
 
 func loadFolder(dir string) {
 	curDir = dir
-	curEntries = collectTxt(dir)
+	ents, err := collectTxt(dir)
+	if err != nil {
+		// 目录读失败（权限/盘符未挂载）：明确报失败，不伪装成"无文档"
+		curEntries = nil
+		_ = lb.SetModel([]string{})
+		if curBook != nil {
+			curBook.Close()
+			curBook = nil
+		}
+		te.SetText("")
+		folderLbl.SetText(fmt.Sprintf("文件夹：%s（读取失败：%v）", dir, err))
+		return
+	}
+	curEntries = ents
 	if err := lb.SetModel(names()); err != nil {
 		return
 	}
@@ -450,16 +506,18 @@ func chooseFontDlg(owner walk.Form) {
 		if f, e := walk.NewFont(curFamily, curSize, 0); e == nil {
 			readerFont = f
 		}
-		// 即时重渲染：字体/行距变化马上反映到当前书
+		// 即时重渲染：字体/行距变化作用于全部已累积内容。
+		// 只渲染当前页会让视图缩回一页，且后续 appendPage 会把旧缓冲弹回来。
 		if curBook != nil {
-			render(curBook.Current())
+			render(strings.Join(accumBuf, "\n\n"))
 		}
+		persist() // 字体/行距偏好落盘
 	}
 
 	d := Dialog{
 		AssignTo: &dlg,
 		Title:    "选择字体",
-		MinSize: Size{Width: 300, Height: 200},
+		MinSize:  Size{Width: 300, Height: 200},
 		Layout:   VBox{},
 		Children: []Widget{
 			Composite{
@@ -492,11 +550,13 @@ type encItem struct {
 	name string
 	enc  encoding.Encoding
 }
+
 var encCandidates = []encItem{
 	{"UTF-8", xunicode.UTF8},
 	{"GB18030", simplifiedchinese.GB18030},
 	{"GBK", simplifiedchinese.GBK},
 	{"UTF-16LE", xunicode.UTF16(xunicode.LittleEndian, xunicode.UseBOM)},
+	{"UTF-16BE", xunicode.UTF16(xunicode.BigEndian, xunicode.UseBOM)},
 	{"Big5", traditionalchinese.Big5},
 }
 
@@ -534,11 +594,11 @@ func chooseEncodingDlg(owner walk.Form) {
 			walk.MsgBox(owner, "切换编码失败", err.Error(), walk.MsgBoxIconError)
 			return
 		}
-		render(curBook.Current()) // 回到首页重渲染
-		if folderLbl != nil {
-			base := filepath.Dir(curBook.Path())
-			folderLbl.SetText(fmt.Sprintf("文件夹：%s（%d 篇）   当前编码：%s", base, len(curEntries), curBook.EncName()))
-		}
+		// ReopenWith 已把游标重置回第 0 页：必须重建累积缓冲，
+		// 否则后续 appendPage 会把旧编码的页 Join 回来（旧乱码复活）。
+		// showCurrent 同时刷新状态栏编码名并持久化（页码归 0）。
+		showCurrent()
+		showTOC() // 目录按新编码重建
 	}
 	d := Dialog{
 		AssignTo: &dlg,
@@ -582,7 +642,7 @@ func showTOC() {
 	curTOC = toc
 	titles := make([]string, len(toc))
 	for i, e := range toc {
-		titles[i] = fmt.Sprintf("第%d页 · %s", e.Page+1, e.Title)
+		titles[i] = e.Title
 	}
 	tocLoading = true
 	_ = tocLB.SetModel(titles)
@@ -618,6 +678,7 @@ func tocJump() {
 		base := filepath.Dir(curBook.Path())
 		folderLbl.SetText(fmt.Sprintf("文件夹：%s（%d 篇）   当前编码：%s", base, len(curEntries), curBook.EncName()))
 	}
+	persist() // 章节跳转即落盘，异常退出不丢进度
 }
 
 // scrollCaretToTop 把 caret 移到页内 rune 偏移 off 处，并滚动使该行成为第一可见行，
@@ -729,8 +790,8 @@ func main() {
 	builder := MainWindow{
 		AssignTo: &mw,
 		Title:    "TXT 阅读器",
-		MinSize: Size{Width: 900, Height: 600},
-		Size:    Size{Width: 1200, Height: 800},
+		MinSize:  Size{Width: 900, Height: 600},
+		Size:     Size{Width: 1200, Height: 800},
 		Layout:   VBox{},
 		Children: []Widget{
 			ToolBar{
@@ -740,11 +801,11 @@ func main() {
 					Action{Text: "打开文件夹", Image: 2, OnTriggered: func() { pickAndLoad() }},
 					Action{Text: "刷新", Image: 14, OnTriggered: func() { refreshCurrent(-1) }},
 					Action{Text: "选择字体", Image: 4, OnTriggered: func() { chooseFontDlg(mw) }},
-				Action{Text: "切换编码", Image: 16, OnTriggered: func() { chooseEncodingDlg(mw) }},
-				Action{Text: "首页", Image: 6, OnTriggered: func() { pageFirst() }},
-				Action{Text: "上一页", Image: 8, OnTriggered: func() { pagePrev() }},
-				Action{Text: "下一页", Image: 10, OnTriggered: func() { pageNext() }},
-				Action{Text: "末页", Image: 12, OnTriggered: func() { pageLast() }},
+					Action{Text: "切换编码", Image: 16, OnTriggered: func() { chooseEncodingDlg(mw) }},
+					Action{Text: "首页", Image: 6, OnTriggered: func() { pageFirst() }},
+					Action{Text: "上一页", Image: 8, OnTriggered: func() { pagePrev() }},
+					Action{Text: "下一页", Image: 10, OnTriggered: func() { pageNext() }},
+					Action{Text: "末页", Image: 12, OnTriggered: func() { pageLast() }},
 				},
 			},
 			Label{AssignTo: &folderLbl, Text: "未选择文件夹（点“打开文件夹”开始）"},
@@ -770,9 +831,9 @@ func main() {
 						},
 					},
 					ListBox{
-						AssignTo:  &tocLB,
-						Visible:   false,
-						Model:     []string{},
+						AssignTo: &tocLB,
+						Visible:  false,
+						Model:    []string{},
 						OnCurrentIndexChanged: func() {
 							tocJump()
 						},
@@ -783,11 +844,11 @@ func main() {
 						VScroll:  true,
 						Font:     Font{Family: curFamily, PointSize: curSize},
 						OnKeyDown: func(key walk.Key) {
-						switch key {
-						case walk.KeyNext:
-							pageNext()
-						case walk.KeyPrior:
-							pagePrev()
+							switch key {
+							case walk.KeyNext:
+								pageNext()
+							case walk.KeyPrior:
+								pagePrev()
 							case walk.KeyHome:
 								pageFirst()
 							case walk.KeyEnd:
@@ -815,7 +876,7 @@ func main() {
 		persist()
 		close(stopInfinite)
 	})
-	restoreState() // 启动恢复上次会话（目录+书+页码），缺失优雅降级
-	startInfiniteScroll(stopInfinite) // 换页式无限滚动：滚到本页底部自动翻下一页
+	restoreState()                    // 启动恢复上次会话（目录+书+页码），缺失优雅降级
+	startInfiniteScroll(stopInfinite) // 累积式加载泵：滚到底自动追加下一页
 	mw.Run()
 }

@@ -19,10 +19,14 @@ if (-not (Get-Command rsrc.exe -ErrorAction SilentlyContinue)) {
     $env:PATH = "$gopath\bin;$env:PATH"
 }
 
-Write-Host "Embedding manifest + toolbar icons (group icon IDs: folder=2, font=4, first=6, prev=8, next=10, last=12, refresh=14) ..."
-rsrc -manifest app.manifest -ico icons\folder.ico,icons\font.ico,icons\first.ico,icons\prev.ico,icons\next.ico,icons\last.ico,icons\refresh.ico -o rsrc.syso
+Write-Host "Embedding manifest + toolbar icons (group icon IDs: folder=2, font=4, first=6, prev=8, next=10, last=12, refresh=14, encode=16) ..."
+rsrc -manifest app.manifest -ico icons\folder.ico,icons\font.ico,icons\first.ico,icons\prev.ico,icons\next.ico,icons\last.ico,icons\refresh.ico,icons\encode.ico -o rsrc.syso
 
 Write-Host "Building single-file exe ..."
+# 显式固定 GOARCH=amd64：默认取平台值，机器上若装了 32 位 Go 会静默退化成 32 位 exe
+# （32 位 EDIT 控件超大文本有失败风险，见 bug 审查报告 P1/P5）。
+$env:GOARCH = 'amd64'
+$env:GOOS = 'windows'
 go build -ldflags="-H windowsgui -s -w" -o txtreader.exe
 
 Write-Host "Done: txtreader.exe"

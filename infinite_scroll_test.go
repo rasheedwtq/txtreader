@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 // TestInfiniteScrollBottom 验证 teAtBottom：短页(一屏放得下)不判到底、
 // 长页初始(顶部)不判到底、长页滚到底后判到底。防止无限滚动误翻/漏翻。
 func TestInfiniteScrollBottom(t *testing.T) {
+	runtime.LockOSThread() // 线程钉死：见 makeTestWindow 注释
 	var mw *walk.MainWindow
 	if err := (MainWindow{
 		AssignTo: &mw,

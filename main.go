@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	pinyin "github.com/mozillazg/go-pinyin"
 	"txtreader/reader"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/encoding/traditionalchinese"
@@ -275,22 +277,14 @@ func restoreState() {
 	if f, e := walk.NewFont(curFamily, curSize, 0); e == nil {
 		readerFont = f
 	}
-	loadFolder(st.LastDir) // 内部已持久化 + 打开第一本（render 用上面的字体/行距）
-	if st.CurrentPath == "" || curBook == nil {
-		return
-	}
-	for i, e := range curEntries {
-		if e.path == st.CurrentPath {
-			lb.SetCurrentIndex(i) // 触发 openAt 打开该书
-			if st.Page > 0 && curBook != nil {
-				if err := curBook.Goto(st.Page); err == nil {
-					showCurrent()
-				}
-			}
-			return
+	// 直接打开上次的书（loadFolderOpen 按路径定位），不再"先开第一本再切换"；
+	// 书已不在时 indexOfPath 落回第一本，保持优雅降级（但不把旧页码套到新书上）。
+	loadFolderOpen(st.LastDir, st.CurrentPath) // 内部已持久化（render 用上面的字体/行距）
+	if st.Page > 0 && curBook != nil && curBook.Path() == st.CurrentPath {
+		if err := curBook.Goto(st.Page); err == nil {
+			showCurrent()
 		}
 	}
-	// 书已不在：loadFolder 已打开第一本，保持即可
 }
 
 func pageNext() {
@@ -417,6 +411,13 @@ func refreshCurrent(selectIdx int) {
 }
 
 func loadFolder(dir string) {
+	loadFolderOpen(dir, "")
+}
+
+// loadFolderOpen 加载目录并打开指定路径的书；openPath 为空则打开第一本。
+// restoreState 直传上次的书，避免"先开第一本再切换"的双开浪费
+// （探针：8MB 书 Open+BuildTOC 一次约 320ms，双开白付一次还闪屏）。
+func loadFolderOpen(dir, openPath string) {
 	curDir = dir
 	ents, err := collectTxt(dir)
 	if err != nil {
@@ -443,12 +444,25 @@ func loadFolder(dir string) {
 	}
 	if len(curEntries) > 0 {
 		folderLbl.SetText(fmt.Sprintf("文件夹：%s（%d 篇）", dir, len(curEntries)))
-		lb.SetCurrentIndex(0)
-		openAt(0) // 兜底：事件未触发也要打开（已打开则同路径判断自动跳过）
+		idx := indexOfPath(openPath) // 空/未命中 → 0
+		lb.SetCurrentIndex(idx)
+		openAt(idx) // 兜底：事件未触发也要打开（已打开则同路径判断自动跳过）
 	} else {
 		te.SetText("")
 		folderLbl.SetText(fmt.Sprintf("文件夹：%s（无文档）", dir))
 	}
+}
+
+// indexOfPath 在 curEntries 中找 path 的索引；未命中或 path 为空返回 0。
+func indexOfPath(path string) int {
+	if path != "" {
+		for i, e := range curEntries {
+			if e.path == path {
+				return i
+			}
+		}
+	}
+	return 0
 }
 
 func pickAndLoad() {
@@ -509,7 +523,16 @@ func chooseFontDlg(owner walk.Form) {
 		// 即时重渲染：字体/行距变化作用于全部已累积内容。
 		// 只渲染当前页会让视图缩回一页，且后续 appendPage 会把旧缓冲弹回来。
 		if curBook != nil {
+			// 记住首可见行，渲染后拉回——WM_SETTEXT 后视口/插入符回 0，
+			// 不拉回的话调字号时正在读的段落会跳回缓冲顶部。
+			var first int
+			if te != nil {
+				first = int(te.SendMessage(win.EM_GETFIRSTVISIBLELINE, 0, 0))
+			}
 			render(strings.Join(accumBuf, "\n\n"))
+			if te != nil {
+				te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_THUMBPOSITION)|(uintptr(first)<<16), 0)
+			}
 		}
 		persist() // 字体/行距偏好落盘
 	}
@@ -622,18 +645,57 @@ func chooseEncodingDlg(owner walk.Form) {
 	}
 }
 
+// tocGen 构建代次：每次 showTOC 递增；后台构建完成时代次不符说明
+// 期间已换书/换编码，结果作废（防旧书目录灌进新书）。
+var tocGen int
+
 // showTOC 构建当前书的章节目录，并在右侧目录栏显示/隐藏。
 // 有目录（≥1 章）→ 显示栏并填充；无目录 → 隐藏栏（自动隐显）。
+// 构建放后台 goroutine（大书全扫实测 600ms+，机械盘更久——放 UI 线程
+// 开书瞬间会卡死），期间目录栏显示"目录加载中…"占位。
 func showTOC() {
 	if tocLB == nil {
 		return
 	}
 	if curBook == nil {
+		tocGen++
 		tocLB.SetVisible(false)
 		curTOC = nil
 		return
 	}
-	toc, err := curBook.BuildTOC()
+	tocGen++
+	gen := tocGen
+	path, enc, pageSize := curBook.TOCParams() // UI 线程快照，避免与 ReopenWith 竞争
+	curTOC = nil
+	tocLoading = true
+	_ = tocLB.SetModel([]string{"目录加载中…"})
+	tocLoading = false
+	tocLB.SetVisible(true)
+	go func() {
+		toc, err := reader.BuildTOCFor(path, enc, pageSize)
+		// mw 已关/测试环境无主窗：直接丢弃，绝不空指针。
+		// 正式运行里 showTOC 只在窗口建成后调用，mw 恒非空；此守卫兜住
+		// 测试直接驱动 loadFolder/openAt 的路径（后台协程晚到时窗口已卸）。
+		if mw == nil {
+			return
+		}
+		mw.Synchronize(func() {
+			applyTOCIf(gen, toc, err)
+		})
+	}()
+}
+
+// applyTOCIf 代次校验后落地：gen 过期（期间已换书/换编码）则丢弃结果。
+// 拆出来是为了可测——Synchronize 回调里只留这一行。
+func applyTOCIf(gen int, toc []reader.TocEntry, err error) {
+	if gen != tocGen {
+		return
+	}
+	applyTOC(toc, err)
+}
+
+// applyTOC 把（可能后台算好的）目录结果落到 UI；须在 UI 线程调用。
+func applyTOC(toc []reader.TocEntry, err error) {
 	if err != nil || len(toc) == 0 {
 		tocLB.SetVisible(false)
 		curTOC = nil
@@ -740,12 +802,43 @@ func vertScrollPos() int {
 }
 
 // appendPage 把新页追加进阅读区，并保持用户视线（位置不动，新内容接在下方）。
+//
+// 纯文本走 EM_REPLACESEL 增量追加：只灌「页间隔 + 新页」，成本只与新页有关，
+// 不随累积量增长。旧实现每次 Join 全缓冲 + SetText 全文重灌——WM_SETTEXT 对
+// EDIT 是全文重排（探针：隐藏窗口 110 页时全量 SetText 30.4s vs 增量追加 5.6ms）。
+// 页面经 clean() TrimSpace，页间 "\n\n" 不与页内换行粘连，applySpacing/disp
+// 可分块等价（TestAppendPageIncremental 按四档行距锁死等价性）。
+//
+// MD 仍走全量重灌：mdBeautify 的围栏状态机与表格对齐跨行块，
+// 围栏/表格可能跨页边界，按页增量会断状态——正确性优先。
 func appendPage(s string) {
 	accumBuf = append(accumBuf, s)
-	full := strings.Join(accumBuf, "\n\n")
 	oldPos := vertScrollPos()
-	te.SetText(displayText(full))
+	if curIsMD {
+		te.SetText(displayText(strings.Join(accumBuf, "\n\n")))
+	} else {
+		appendTextTE(displayText("\n\n" + s))
+	}
 	te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_THUMBPOSITION)|(uintptr(oldPos)<<16), 0)
+}
+
+// appendTextTE 把 text 追加到 TextEdit 末尾（EM_SETSEL 末尾 + EM_REPLACESEL），
+// 不动已有内容。末尾偏移取 WM_GETTEXTLENGTH——它与 EM_SETSEL 同为 UTF-16
+// code unit 口径，页内出现 emoji 也不会错位（顺带免疫 P3）。
+//
+// EM_SETLIMITTEXT 必须先提限：EDIT 默认文本上限 30000 字符，WM_SETTEXT
+// 绕过它（全量重灌路径从没事），EM_REPLACESEL 却受它约束——超限插入被
+// 截断/拒绝（探针：默认上限 30000，提限后 10 万字符仍可增量插）。
+func appendTextTE(text string) {
+	te.SendMessage(win.EM_SETLIMITTEXT, uintptr(0x7FFFFFFE), 0)
+	end := te.SendMessage(win.WM_GETTEXTLENGTH, 0, 0)
+	te.SendMessage(win.EM_SETSEL, end, end)
+	utf16, err := windows.UTF16PtrFromString(text)
+	if err != nil {
+		return
+	}
+	te.SendMessage(win.EM_REPLACESEL, 0, uintptr(unsafe.Pointer(utf16)))
+	runtime.KeepAlive(utf16)
 }
 
 // appendTick 泵：到底且还有下一页 → 追加（追加后位置不在底，不会连续误触发）。
@@ -876,7 +969,31 @@ func main() {
 		persist()
 		close(stopInfinite)
 	})
-	restoreState()                    // 启动恢复上次会话（目录+书+页码），缺失优雅降级
+	// 命令行路径参数（README 承诺）：txtreader.exe [路径]，路径可为文件或目录。
+	// 有参数 → 直接打开该路径；无参数 → 恢复上次会话。
+	if !openCLIPath() {
+		restoreState() // 启动恢复上次会话（目录+书+页码），缺失优雅降级
+	}
 	startInfiniteScroll(stopInfinite) // 累积式加载泵：滚到底自动追加下一页
 	mw.Run()
+}
+
+// openCLIPath 处理命令行路径参数；返回是否成功接管启动（无参数/路径无效返回 false）。
+// 文件 → 打开所在目录并选中该文件；目录 → 打开该目录。
+func openCLIPath() bool {
+	if len(os.Args) < 2 {
+		return false
+	}
+	p := filepath.Clean(os.Args[1]) // 统一分隔符，保证与 collectTxt 的 Join 路径可比
+	fi, err := os.Stat(p)
+	if err != nil {
+		return false
+	}
+	if fi.IsDir() {
+		loadFolder(p)
+		return true
+	}
+	// 文件：打开所在目录并定位到该文件
+	loadFolderOpen(filepath.Dir(p), p)
+	return true
 }

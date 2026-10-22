@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/transform"
 )
 
@@ -71,12 +72,25 @@ func isChapterTitle(s string) bool {
 // 用独立文件句柄扫描，不触碰 Book 当前的分页游标/缓存（不影响阅读位置）。
 // 页码按「行首原始 rune 偏移 / pageSize」计算，与 Goto 定位一致。
 func (b *Book) BuildTOC() ([]TocEntry, error) {
-	f, err := os.Open(b.path)
+	return BuildTOCFor(b.path, b.enc, b.pageSize)
+}
+
+// TOCParams 返回建目录所需的只读参数快照（path/enc/pageSize）。
+// UI 线程先快照、再交给后台 goroutine 调 BuildTOCFor，
+// 避免后台扫描与 ReopenWith（换编码）并发读写 Book 字段的数据竞争。
+func (b *Book) TOCParams() (string, encoding.Encoding, int) {
+	return b.path, b.enc, b.pageSize
+}
+
+// BuildTOCFor 用给定路径/编码/页大小独立扫描建目录；自带文件句柄，
+// 不触碰任何 Book 状态，可后台并发调用（页码口径与 Book.BuildTOC 一致）。
+func BuildTOCFor(path string, enc encoding.Encoding, pageSize int) ([]TocEntry, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	r := transform.NewReader(f, b.enc.NewDecoder())
+	r := transform.NewReader(f, enc.NewDecoder())
 	br := bufio.NewReader(r)
 
 	var toc []TocEntry
@@ -90,7 +104,7 @@ func (b *Book) BuildTOC() ([]TocEntry, error) {
 			if reMD.MatchString(title) {
 				title = strings.TrimSpace(reMDStrip.ReplaceAllString(title, "")) // TOC 显示去掉 # 前缀
 			}
-			toc = append(toc, TocEntry{Title: title, Page: lineStart / b.pageSize, Offset: lineStart})
+			toc = append(toc, TocEntry{Title: title, Page: lineStart / pageSize, Offset: lineStart})
 		}
 		line.Reset()
 	}

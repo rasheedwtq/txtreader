@@ -20,15 +20,23 @@ var (
 	reMDCode     = regexp.MustCompile("`([^`\n]+)`")
 )
 
-// mdBeautify 逐行转换 + 表格块对齐重排（行数不变）。
+// mdFenceState 围栏代码块状态机的跨页状态。增量逐页美化时在页间传递，
+// 保证与整段一次 mdBeautify 的结果一致（页边界是空行，对围栏/表格都是中性边界）。
+type mdFenceState struct {
+	in     bool
+	marker rune
+	length int
+}
+
+// mdBeautifyState 逐行转换 + 表格块对齐重排（行数不变），并返回行末围栏状态。
 // 围栏代码块（``` / ~~~）内逐字保留：块里的 #、>、** 是代码不是排版，
 // 误美化会把注释行缩进成假标题。围栏开/闭行本身也原样保留。
-func mdBeautify(s string) string {
+func mdBeautifyState(s string, st mdFenceState) (string, mdFenceState) {
 	lines := strings.Split(s, "\n")
 	fenced := make([]bool, len(lines)) // 该行是否处于围栏内（含围栏行本身）
-	inFence := false
-	var fenceMarker rune
-	fenceLen := 0
+	inFence := st.in
+	fenceMarker := st.marker
+	fenceLen := st.length
 	for i, ln := range lines {
 		t := strings.TrimSpace(ln)
 		if m, n, ok := mdFence(t); ok {
@@ -51,7 +59,13 @@ func mdBeautify(s string) string {
 		lines[i] = mdLine(ln)
 	}
 	alignTables(lines, fenced)
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), mdFenceState{in: inFence, marker: fenceMarker, length: fenceLen}
+}
+
+// mdBeautify 整段一次美化（兼容入口）：围栏状态从零起算。
+func mdBeautify(s string) string {
+	out, _ := mdBeautifyState(s, mdFenceState{})
+	return out
 }
 
 // mdFence 识别围栏行：0~3 空格缩进 + 至少 3 个 ` 或 ~（可带 info string）。

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -16,6 +17,7 @@ import (
 // TestAccumScroll 验证累积式无限滚动：
 // 到底追加下一页、连续追加到末页、向上滚前文仍在（回看自由）、eof 后不再追加。
 func TestAccumScroll(t *testing.T) {
+	runtime.LockOSThread() // 线程钉死：见 makeTestWindow 注释
 	var mw *walk.MainWindow
 	if err := (MainWindow{
 		AssignTo: &mw,

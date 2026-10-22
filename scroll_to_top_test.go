@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 
 // TestScrollCaretToTop 验证 scrollCaretToTop 把目标行滚到阅读区第一行。
 func TestScrollCaretToTop(t *testing.T) {
+	runtime.LockOSThread() // 线程钉死：见 makeTestWindow 注释
 	var mw *walk.MainWindow
 	if err := (MainWindow{
 		AssignTo: &mw,

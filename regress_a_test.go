@@ -56,8 +56,9 @@ func TestAppendPageIncremental(t *testing.T) {
 		curSpacing = sp
 		curIsMD = false
 
-		// 路径 A（旧）：全量 SetText
-		want := displayText(strings.Join(pages, "\n\n"))
+		// 路径 A（旧）：全量 SetText（页间隔符与 appendPage 同源 pageJoin，
+		// 空行全收档位下两侧同为 \n，不变式仍锁死）
+		want := displayText(strings.Join(pages, pageJoin()))
 
 		// 路径 B（新）：首屏 SetText + 逐页增量
 		accumBuf = []string{pages[0]}
@@ -82,7 +83,7 @@ func TestAppendPageIncremental(t *testing.T) {
 	}
 	curSpacing = 1
 	curIsMD = false
-	wantBig := displayText(strings.Join(bigPages, "\n\n"))
+	wantBig := displayText(strings.Join(bigPages, pageJoin()))
 	accumBuf = []string{bigPages[0]}
 	render(bigPages[0])
 	for _, p := range bigPages[1:] {

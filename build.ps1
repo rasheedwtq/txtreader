@@ -11,6 +11,15 @@ if (-not (Get-Command go.exe -ErrorAction SilentlyContinue)) {
     }
 }
 
+# Build env fixed (same as dev/test): local Go + module cache + CN proxy.
+# 2026-10-23 lesson: without GOPROXY, `go build` silently fails to fetch new
+# deps (proxy.golang.org blocked) and the script still prints Done — the exe
+# stays STALE. Always check $LASTEXITCODE after native commands.
+$env:GOPROXY = 'https://goproxy.cn,direct'
+$env:GOROOT = 'D:\project\txt\go_pkg\go'
+$env:GOPATH = 'D:\project\txt\gopath'
+$env:GOMODCACHE = 'D:\project\txt\gopath\pkg\mod'
+
 # Install rsrc (embeds manifest + toolbar icons into the exe).
 if (-not (Get-Command rsrc.exe -ErrorAction SilentlyContinue)) {
     Write-Host "Installing rsrc ..."
@@ -28,5 +37,6 @@ Write-Host "Building single-file exe ..."
 $env:GOARCH = 'amd64'
 $env:GOOS = 'windows'
 go build -ldflags="-H windowsgui -s -w" -o txtreader.exe
+if ($LASTEXITCODE -ne 0) { throw "go build FAILED (exit $LASTEXITCODE), exe NOT updated" }
 
 Write-Host "Done: txtreader.exe"

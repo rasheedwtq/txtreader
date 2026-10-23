@@ -20,8 +20,9 @@ var (
 	reMDCode     = regexp.MustCompile("`([^`\n]+)`")
 )
 
-// mdFenceState 围栏代码块状态机的跨页状态。增量逐页美化时在页间传递，
-// 保证与整段一次 mdBeautify 的结果一致（页边界是空行，对围栏/表格都是中性边界）。
+// mdFenceState 围栏代码块状态机的跨页状态。预留：MD 路径当前走全量重灌
+// （appendPage 对 md 用 SetText），一次 mdBeautify 传零值状态即可；
+// 若未来做 md 增量美化，用此结构在页间传递围栏状态。
 type mdFenceState struct {
 	in     bool
 	marker rune

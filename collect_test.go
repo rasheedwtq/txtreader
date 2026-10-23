@@ -66,8 +66,8 @@ func TestCollectNoRecurse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ents) != 4 {
-		t.Fatalf("应收当前层 4 篇（3 txt + 1 md；不递归子目录、不收 pdf/epub/mobi），got %d：%v", len(ents), ents)
+	if len(ents) != 5 {
+		t.Fatalf("应收当前层 5 篇（3 txt + 1 md + 1 epub；不递归子目录、不收 pdf/mobi），got %d：%v", len(ents), ents)
 	}
 }
 

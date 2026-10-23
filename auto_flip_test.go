@@ -54,7 +54,6 @@ func TestAccumScroll(t *testing.T) {
 	if err := b.Goto(0); err != nil {
 		t.Fatal(err)
 	}
-	accumBase = 0
 	accumBuf = []string{b.Current()}
 	render(b.Current())
 	if !strings.Contains(te.Text(), "000") {

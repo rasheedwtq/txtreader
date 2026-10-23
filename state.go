@@ -15,6 +15,24 @@ type appState struct {
 	FontFamily  string `json:"font_family"`
 	FontSize    int    `json:"font_size"`
 	LineSpacing int    `json:"line_spacing"`
+	// 清洗偏好三态指针：nil=旧配置文件无此字段→保持默认（A1/B1/E1 全开），
+	// 非 nil=用户明确改过。Plain bool 会把"没配过"误当成"用户关了"。
+	CleanIndent   *bool `json:"clean_indent,omitempty"`
+	CleanAd       *bool `json:"clean_ad,omitempty"`
+	CleanBlankAll *bool `json:"clean_blank_all,omitempty"`
+	// 窗口状态：RcNormalPosition 口径（最大化时存的也是还原尺寸）。
+	// 零值（旧文件缺字段）= 未记录，不恢复。恢复前须过显示器边界检查。
+	WinX   int  `json:"win_x,omitempty"`
+	WinY   int  `json:"win_y,omitempty"`
+	WinW   int  `json:"win_w,omitempty"`
+	WinH   int  `json:"win_h,omitempty"`
+	WinMax bool `json:"win_max,omitempty"`
+	// 行级书签（视口锚点）：关窗时屏幕第一可见行的行首文字 + 其所在页码。
+	// 页粒度（20000 字符/页）对短篇无效——15000 字的小说整本只有 1 页，
+	// 页码永远是 0，页内位置必须靠锚点记。恢复时在显示文本里搜锚点行滚回去，
+	// 找不到（正文/设置变了）退化为页首。
+	ViewPage   int    `json:"view_page,omitempty"`
+	ViewAnchor string `json:"view_anchor,omitempty"`
 }
 
 const stateFileName = "txtreader.state.json"

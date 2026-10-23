@@ -44,6 +44,15 @@ var (
 	readerFont *walk.Font
 	curIsMD    bool // 当前打开的是 .md 文件（显示层走 md 美化）
 
+	// curClean 全局清洗偏好（A1/B1/E1 拍板默认全开；.md 由 effectiveClean 强制豁免
+	// Indent/BlankAll——md 美化的空行与行首缩进是块语义，见 md.go 硬约束）。
+	curClean = reader.CleanOptions{Indent: true, AdFilter: true, BlankAll: true}
+
+	// lastState 启动时的状态快照（单本进度记的就是这一份）：openAt 打开同一本
+	// 书时据此回跳页码。现场 bug（2026-10-22）：CLI 双击打开不走会话恢复，
+	// openAt 从第 0 页起 + showCurrent 立即 persist，把上次进度覆盖成 page=0。
+	lastState appState
+
 	tocLB      *walk.ListBox // 右侧章节目录栏（有目录时显示，无则隐藏）
 	curTOC     []reader.TocEntry
 	tocLoading bool // SetModel 期间屏蔽 OnCurrentIndexChanged 误跳
@@ -102,7 +111,7 @@ func collectTxt(dir string) ([]entry, error) {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(de.Name()))
-		if ext != ".txt" && ext != ".md" {
+		if ext != ".txt" && ext != ".md" && ext != ".epub" {
 			continue // 跳过子目录与非文本书
 		}
 		ents = append(ents, entry{name: de.Name(), path: filepath.Join(dir, de.Name())})
@@ -175,6 +184,26 @@ func applySpacing(s string) string {
 	return tmp
 }
 
+// effectiveClean 按文件类型落地清洗口径：.md 豁免 Indent/BlankAll
+// （行首缩进与空行是 md 块语义，动它会毁代码块/列表/围栏），AdFilter 跟随全局。
+func effectiveClean(path string) reader.CleanOptions {
+	if strings.EqualFold(filepath.Ext(path), ".md") {
+		return reader.CleanOptions{AdFilter: curClean.AdFilter}
+	}
+	return curClean
+}
+
+// pageJoin 页间分隔符：空行全收模式下用单换行，否则单空行。
+// B5：必须按当前书的实际口径取值——.md 被 effectiveClean 强制 BlankAll=false
+// （空行是 md 块语义），但全局开关可能仍是开的；md 页界要维持 "\n\n" 中性边界。
+// appendPage 增量追加与全量重灌两条路径必须同用本函数（不变式：增量 ≡ 全量）。
+func pageJoin() string {
+	if !curIsMD && curClean.BlankAll {
+		return "\n"
+	}
+	return "\n\n"
+}
+
 // displayText 显示层总出口：md 美化 → 行距 → 换行符。
 func displayText(s string) string {
 	if curIsMD {
@@ -218,14 +247,49 @@ func openAt(idx int) {
 		curBook.Close()
 		curBook = nil
 	}
-	b, err := reader.Open(curEntries[idx].path)
+	var b *reader.Book
+	var err error
+	if strings.EqualFold(filepath.Ext(curEntries[idx].path), ".epub") {
+		b, err = reader.OpenEpub(curEntries[idx].path) // EPUB：解包→内存流
+	} else {
+		b, err = reader.Open(curEntries[idx].path)
+	}
 	if err != nil {
 		te.SetText(disp(fmt.Sprintf("无法打开文件：\n%s\n\n%v", curEntries[idx].path, err)))
 		return
 	}
 	curBook = b
 	curIsMD = strings.EqualFold(filepath.Ext(curEntries[idx].path), ".md")
+	b.SetCleanOpts(effectiveClean(curEntries[idx].path)) // 全局清洗偏好落位（Open 默认 LegacyClean）
+	// 单本进度恢复（CLI 双击/会话两条路统一走这里）：先回页，再把行级书签
+	// （视口锚点）滚回第一可见行——短篇只有 1 页，页码恢复不了位置，全靠锚点。
+	// 锚点搜不到（正文/字体/清洗设置变了）自然退化为页首，即旧行为。
+	// 时序陷阱（现场 bug 2026-10-22）：showCurrent 内部会 persist 并刷新
+	// lastState（此刻视口在文档顶部），锚点必须在 showCurrent **之前**快照，
+	// 否则搜的是被覆盖后的"第一行"，永远滚回文档开头。
+	remembered := lastState.CurrentPath == curEntries[idx].path
+	var restorePage int
+	var restoreAnchor string
+	if remembered {
+		restorePage = lastState.ViewPage
+		restoreAnchor = lastState.ViewAnchor
+		// E4（2026-10-23 审查）：旧口径 state.json 只有 page 没有 view_page，
+		// 缺迁移会把老进度整本作废（条件命中但 Goto(0)）。
+		if restoreAnchor == "" && lastState.ViewPage == 0 && lastState.Page > 0 {
+			restorePage = lastState.Page
+		}
+		if lastState.Page > 0 || restoreAnchor != "" {
+			_ = b.Goto(restorePage) // ViewPage==0（短篇单页）即第 0 页，合法
+		}
+	}
 	showCurrent()
+	if remembered && restoreAnchor != "" && te != nil {
+		d := te.Text() // disp 形式（\r\n），与保存锚点时同源
+		if bi := strings.Index(d, restoreAnchor); bi >= 0 {
+			scrollCaretToTop(len([]rune(d[:bi])))
+		} else {
+		}
+	}
 	showTOC()
 }
 
@@ -235,6 +299,7 @@ func showCurrent() {
 	}
 	accumBase = curBook.Page()
 	accumBuf = []string{curBook.Current()}
+	dispStale = true
 	render(curBook.Current())
 	if folderLbl != nil {
 		base := filepath.Dir(curBook.Path())
@@ -243,28 +308,198 @@ func showCurrent() {
 	persist() // 打开书即持久化（目录+书+页码0）
 }
 
+// captureView 捕捉当前视口：第一可见行的行首文字作行级书签 + 其所在页码。
+// EM_GETFIRSTVISIBLELINE 拿行号 → EM_LINEINDEX 拿行首 UTF-16 偏移 → 从
+// te.Text() 切出该行（trim 后取前 24 rune）；锚点在 accumBuf 里从后往前
+// 定位所在页（accumBase+j）。已知口径瑕疵：EM_LINEINDEX 是 UTF-16 单位，
+// 首屏前含 emoji 时 rune 切位会错（P3' 家族），最坏结果是锚点取偏 →
+// 恢复时搜不到 → 退化为页首，可接受。须在 UI 线程调用。
+func captureView() (int, string) {
+	if te == nil || curBook == nil {
+		return 0, ""
+	}
+	first := int(te.SendMessage(win.EM_GETFIRSTVISIBLELINE, 0, 0))
+	if first < 0 {
+		first = 0
+	}
+	charIdx := int(te.SendMessage(win.EM_LINEINDEX, uintptr(first), 0))
+	txt := te.Text()
+	rs := []rune(txt)
+	if charIdx < 0 || charIdx >= len(rs) {
+		charIdx = 0
+	}
+	line := rs[charIdx:]
+	for i, r := range line {
+		if r == '\n' {
+			line = line[:i]
+			break
+		}
+	}
+	anchor := strings.TrimSpace(string(line))
+	if anchor == "" {
+		// 首可见行是空行（用户停在空行处关窗，或拉到段间空白）：向下找最近的
+		// 非空行作锚点——没有"标签"的纯文本/空行分隔的文档也要能记位置。
+		// 恢复时会落在该行（误差 ≤ 一个空行段），好过整个锚点丢失退回页首。
+		rest := rs[charIdx:]
+		start := 0
+		for start < len(rest) {
+			end := start
+			for end < len(rest) && rest[end] != '\n' {
+				end++
+			}
+			cand := strings.TrimSpace(string(rest[start:end]))
+			if cand != "" {
+				anchor = cand
+				break
+			}
+			start = end + 1
+		}
+	}
+	if ar := []rune(anchor); len(ar) > 24 {
+		anchor = string(ar[:24])
+	}
+	if anchor == "" {
+		return curBook.Page(), ""
+	}
+	// 锚点所在页：按【显示偏移】映射，不用 Contains(原始页文本, 锚点)——
+	// md 美化会改写行内容（表格对齐加空格、剥 **/#），美化后的锚点不是原始
+	// 页文本的子串，包含匹配会误丢锚点（2026-10-22 现场：落在 SECI 表格行，
+	// 锚点记成空 → 进度丢失）。te.Text() ≡ displayText(join(accumBuf, sep))
+	// 是既有不变式（增量追加 ≡ 全量重灌），按每页显示长度切分即可定位。
+	off := charIdx
+	if off >= len(rs) {
+		off = len(rs) - 1
+	}
+	return accumBase + dispPageOf(off), anchor // 映射失败兜底：锚点仍保留（页号可能偏，恢复时搜不到会退化页首）
+}
+
+// ---- 视口页映射前缀缓存（P1，2026-10-23 审查）----
+// dispPrefix[i] = 第 i 页显示文本在 te.Text() 里的起始偏移。persist 有 8 个
+// 调用点，captureView 原实现每次都对 accumBuf 全量 displayText（含 mdBeautify
+// + []rune 转换），累积几十页后每次落盘都是百万字符级扫描。缓存后单次落盘
+// 降为 O(log n) 二分；重建条件不满足即整体重算一次（= 旧实现单次成本）。
+var (
+	dispPrefix  []int
+	dispStale   = true
+	dispSpacing = -1                // 行距档变化 → displayText 输出变，须重建
+	dispClean   reader.CleanOptions // 清洗档变化 → 同上（按值比较）
+)
+
+func dispPageOf(off int) int {
+	if dispStale || dispSpacing != curSpacing || dispClean != curClean || len(dispPrefix) != len(accumBuf) {
+		sepD := len([]rune(displayText(pageJoin())))
+		dispPrefix = dispPrefix[:0]
+		pos := 0
+		for j := range accumBuf {
+			dispPrefix = append(dispPrefix, pos)
+			pos += len([]rune(displayText(accumBuf[j]))) + sepD
+		}
+		dispSpacing = curSpacing
+		dispClean = curClean
+		dispStale = false
+	}
+	// 落在最后一页之外的偏移（越界/尾页后空白）取最后一页
+	j := sort.Search(len(dispPrefix), func(i int) bool { return dispPrefix[i] > off }) - 1
+	if j < 0 {
+		j = 0
+	}
+	return j
+}
+
 // persist 把当前会话状态写到 exe 同目录的 txtreader.state.json。
 func persist() {
 	st := appState{
-		LastDir:     curDir,
-		FontFamily:  curFamily,
-		FontSize:    curSize,
-		LineSpacing: curSpacing,
+		LastDir:       curDir,
+		FontFamily:    curFamily,
+		FontSize:      curSize,
+		LineSpacing:   curSpacing,
+		CleanIndent:   boolPtr(curClean.Indent),
+		CleanAd:       boolPtr(curClean.AdFilter),
+		CleanBlankAll: boolPtr(curClean.BlankAll),
 	}
 	if curBook != nil {
 		st.CurrentPath = curBook.Path()
 		st.Page = curBook.Page()
+		st.ViewPage, st.ViewAnchor = captureView() // 行级书签：第一可见行（UI 线程）
+	}
+	if mw != nil { // 测试环境可能无主窗（全局 mw 被 makeTestWindow 遮蔽）
+		saveWindowRect(&st)
 	}
 	saveState(st)
+	lastState = st // 快照同步：下次 openAt 打开同一本书时能恢复到最新页码
 }
 
-// restoreState 启动时恢复上次会话（目录+书+页码+外观）；目录/书不存在则优雅降级。
-func restoreState() {
-	st, ok := loadState()
-	if !ok || st.LastDir == "" {
+func boolPtr(b bool) *bool { return &b }
+
+// ---- 窗口状态记忆（方案《阅读进度与窗口状态记忆方案》§2）----
+
+// saveWindowRect 记录窗口几何。用 WINDOWPLACEMENT 的 RcNormalPosition：
+// 最大化时存的也是"还原尺寸"，避免下次先弹一个全屏尺寸的还原态。
+func saveWindowRect(st *appState) {
+	var wp win.WINDOWPLACEMENT
+	wp.Length = uint32(unsafe.Sizeof(wp))
+	if !win.GetWindowPlacement(mw.Handle(), &wp) {
 		return
 	}
-	// 先恢复外观偏好（字体/字号/行间距），后续 render 会自动应用
+	r := wp.RcNormalPosition
+	st.WinX = int(r.Left)
+	st.WinY = int(r.Top)
+	st.WinW = int(r.Right - r.Left)
+	st.WinH = int(r.Bottom - r.Top)
+	if st.WinW <= 0 || st.WinH <= 0 {
+		st.WinX, st.WinY, st.WinW, st.WinH = 0, 0, 0, 0 // 脏值不落
+		return
+	}
+	st.WinMax = win.IsZoomed(mw.Handle())
+}
+
+// winRectVisible 边界检查：窗口矩形与虚拟桌面（所有显示器的外接矩形）
+// 交集 ≥ 20% 面积才算可见可恢复——防拔副屏/改分辨率后窗口消失在屏幕外。
+func winRectVisible(x, y, w, h int) bool {
+	vx := int(win.GetSystemMetrics(win.SM_XVIRTUALSCREEN))
+	vy := int(win.GetSystemMetrics(win.SM_YVIRTUALSCREEN))
+	vw := int(win.GetSystemMetrics(win.SM_CXVIRTUALSCREEN))
+	vh := int(win.GetSystemMetrics(win.SM_CYVIRTUALSCREEN))
+	ix := min(x+w, vx+vw) - max(x, vx)
+	iy := min(y+h, vy+vh) - max(y, vy)
+	if ix <= 0 || iy <= 0 {
+		return false
+	}
+	return uint64(ix)*uint64(iy)*5 >= uint64(w)*uint64(h)
+}
+
+// restoreWindowRect 恢复窗口几何：先还原尺寸，再按需最大化。
+func restoreWindowRect(st appState) {
+	if st.WinW <= 0 || st.WinH <= 0 || mw == nil {
+		return
+	}
+	if !winRectVisible(st.WinX, st.WinY, st.WinW, st.WinH) {
+		return // 坐标落在现有显示器之外，放弃恢复用默认值
+	}
+	_ = mw.SetX(st.WinX)
+	_ = mw.SetY(st.WinY)
+	_ = mw.SetWidth(st.WinW)
+	_ = mw.SetHeight(st.WinH)
+	if st.WinMax {
+		win.ShowWindow(mw.Handle(), win.SW_MAXIMIZE)
+	}
+}
+
+// restoreSession 恢复上次会话（目录+书）；页码恢复统一在 openAt 里按
+// lastState 做（CLI 双击路径同样生效），此处不再单独 Goto。
+func restoreSession(st appState) {
+	if st.LastDir == "" {
+		return
+	}
+	// 直接打开上次的书（loadFolderOpen 按路径定位），不再"先开第一本再切换"；
+	// 书已不在时 indexOfPath 落回第一本，保持优雅降级（但不把旧页码套到新书上）。
+	loadFolderOpen(st.LastDir, st.CurrentPath) // 内部已持久化
+}
+
+// restorePrefs 恢复外观与清洗偏好（字体/字号/行距/清洗三开关 + 阅读字体对象）。
+// 独立成函数：会话恢复与 CLI 启动两条路都必须调用——CLI 路径原来整个跳过
+// restoreState，导致双击打开文件时"宋体 18 号超宽行距关广告"全部回默认（B1）。
+func restorePrefs(st appState) {
 	if st.FontFamily != "" {
 		curFamily = st.FontFamily
 	}
@@ -274,16 +509,18 @@ func restoreState() {
 	if st.LineSpacing >= 0 && st.LineSpacing <= 3 {
 		curSpacing = st.LineSpacing // 越界脏值不采用（缺字段时为 0=紧凑，与旧版行为一致）
 	}
+	// 清洗偏好：nil（旧配置文件）保持默认 A1/B1/E1 全开；非 nil 采用用户上次的选择
+	if st.CleanIndent != nil {
+		curClean.Indent = *st.CleanIndent
+	}
+	if st.CleanAd != nil {
+		curClean.AdFilter = *st.CleanAd
+	}
+	if st.CleanBlankAll != nil {
+		curClean.BlankAll = *st.CleanBlankAll
+	}
 	if f, e := walk.NewFont(curFamily, curSize, 0); e == nil {
 		readerFont = f
-	}
-	// 直接打开上次的书（loadFolderOpen 按路径定位），不再"先开第一本再切换"；
-	// 书已不在时 indexOfPath 落回第一本，保持优雅降级（但不把旧页码套到新书上）。
-	loadFolderOpen(st.LastDir, st.CurrentPath) // 内部已持久化（render 用上面的字体/行距）
-	if st.Page > 0 && curBook != nil && curBook.Path() == st.CurrentPath {
-		if err := curBook.Goto(st.Page); err == nil {
-			showCurrent()
-		}
 	}
 }
 
@@ -529,7 +766,7 @@ func chooseFontDlg(owner walk.Form) {
 			if te != nil {
 				first = int(te.SendMessage(win.EM_GETFIRSTVISIBLELINE, 0, 0))
 			}
-			render(strings.Join(accumBuf, "\n\n"))
+			render(strings.Join(accumBuf, pageJoin()))
 			if te != nil {
 				te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_THUMBPOSITION)|(uintptr(first)<<16), 0)
 			}
@@ -568,6 +805,52 @@ func chooseFontDlg(owner walk.Form) {
 	}
 }
 
+// cleanOptionsDlg 清洗设置对话框：段首缩进 / 广告行过滤 / 空行全收（方案 §2.4）。
+// 确定即落位：改 Book 口径 → 按 rune 偏移口径回跳原页 → 重建目录 → 持久化。
+// .md 自动豁免 Indent/BlankAll（勾了也不生效，effectiveClean 强制）。
+func cleanOptionsDlg(owner walk.Form) {
+	var cbIndent, cbAd, cbBlank *walk.CheckBox
+	var dlg *walk.Dialog
+	apply := func() {
+		curClean.Indent = cbIndent.Checked()
+		curClean.AdFilter = cbAd.Checked()
+		curClean.BlankAll = cbBlank.Checked()
+		if curBook == nil {
+			return
+		}
+		// B6：SetCleanOpts 内部已按原页码 readUpTo 回位，紧随的 Goto(page) 是
+		// 纯重复劳动（深页切档成本 2×O(文件)，UI 线程冻结翻倍）——删。
+		// SetCleanOpts 口径未变时自带防抖早退，重复点确定也无重读。
+		curBook.SetCleanOpts(effectiveClean(curBook.Path()))
+		showCurrent()
+		showTOC() // 广告行剔除/空行全收会改变目录扫描所见，重建
+		persist()
+	}
+	d := Dialog{
+		AssignTo: &dlg,
+		Title:    "清洗设置",
+		MinSize:  Size{Width: 340, Height: 220},
+		Layout:   VBox{},
+		Children: []Widget{
+			Label{Text: "只影响显示，不修改源文件；重开即恢复。", TextColor: walk.RGB(120, 120, 120)},
+			CheckBox{AssignTo: &cbIndent, Text: "段首缩进规整（统一 2 个全角空格）", Checked: curClean.Indent},
+			CheckBox{AssignTo: &cbAd, Text: "过滤整行广告（求票/网址/笔趣阁等）", Checked: curClean.AdFilter},
+			CheckBox{AssignTo: &cbBlank, Text: "空行全收（配合段首缩进 = 纸书排版）", Checked: curClean.BlankAll},
+			Label{Text: "注：.md 文件自动豁免缩进与空行全收（保留块语义）。", TextColor: walk.RGB(120, 120, 120)},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					PushButton{Text: "确定", OnClicked: func() { apply(); dlg.Accept() }},
+					PushButton{Text: "取消", OnClicked: func() { dlg.Cancel() }},
+				},
+			},
+		},
+	}
+	if _, err := d.Run(owner); err != nil {
+		return
+	}
+}
+
 // encCandidates 编码兜底的可选列表（中文书库为主，覆盖常见乱码来源）。
 type encItem struct {
 	name string
@@ -591,6 +874,12 @@ type stretchSetter interface{ SetStretchFactor(walk.Widget, int) error }
 func chooseEncodingDlg(owner walk.Form) {
 	if curBook == nil {
 		walk.MsgBox(owner, "提示", "请先打开一本书，再切换编码。", walk.MsgBoxIconInformation)
+		return
+	}
+	// L2（2026-10-23 审查）：EPUB 解包后是 UTF-8 内存流，原文已在解包时定死，
+	// 换编码重解必然乱码且无法回退——直接拦截。
+	if curBook.IsEpub() {
+		walk.MsgBox(owner, "提示", "EPUB 内容已解包为 UTF-8 文本，无需也无法切换编码。", walk.MsgBoxIconInformation)
 		return
 	}
 	labels := make([]string, len(encCandidates))
@@ -665,14 +954,14 @@ func showTOC() {
 	}
 	tocGen++
 	gen := tocGen
-	path, enc, pageSize := curBook.TOCParams() // UI 线程快照，避免与 ReopenWith 竞争
+	buildFn := curBook.TOCFunc() // UI 线程取快照（txt=文件参数；epub=内存构建）
 	curTOC = nil
 	tocLoading = true
 	_ = tocLB.SetModel([]string{"目录加载中…"})
 	tocLoading = false
 	tocLB.SetVisible(true)
 	go func() {
-		toc, err := reader.BuildTOCFor(path, enc, pageSize)
+		toc, err := buildFn()
 		// mw 已关/测试环境无主窗：直接丢弃，绝不空指针。
 		// 正式运行里 showTOC 只在窗口建成后调用，mw 恒非空；此守卫兜住
 		// 测试直接驱动 loadFolder/openAt 的路径（后台协程晚到时窗口已卸）。
@@ -706,9 +995,14 @@ func applyTOC(toc []reader.TocEntry, err error) {
 	for i, e := range toc {
 		titles[i] = e.Title
 	}
+	// tocLoading 必须护住整个落地过程（SetModel/SetCurrentIndex/SetVisible/
+	// SetStretchFactor 都可能触发 OnCurrentIndexChanged）——现场日志抓到
+	// TOC 弹出后 tocJump 被异步事件拽到尾部条目的"漂移"。落地完清掉选中态，
+	// 不给任何"无人点击的章节跳转"留口子。
 	tocLoading = true
+	defer func() { tocLoading = false }()
 	_ = tocLB.SetModel(titles)
-	tocLoading = false
+	_ = tocLB.SetCurrentIndex(-1)
 	tocLB.SetVisible(true)
 	if hs != nil {
 		if ss, ok := hs.Layout().(stretchSetter); ok {
@@ -731,8 +1025,12 @@ func tocJump() {
 	if err != nil {
 		return
 	}
+	// E2（2026-10-23 审查）：缓冲被重置为跳入章节这一页，坐标系必须跟着走——
+	// 否则 captureView 用旧 accumBase 定页，跳章后关窗存下错误 ViewPage，
+	// 重开恢复错位，且错值污染后续整个会话的锚点页映射。
 	accumBase = curBook.Page()
 	accumBuf = []string{text}
+	dispStale = true
 	render(text)
 	// 美化会改变每行字符数，在显示文本里重搜标题位置，避免错行
 	scrollCaretToTop(displayRuneOffset(text, e.Title))
@@ -776,7 +1074,7 @@ func teAtBottom() bool {
 
 var (
 	accumBuf  []string // 已显示的各页文本（clean 后，\n 形式）
-	accumBase int      // 缓冲首页的页码（TOC 跳转/末页后 >0）
+	accumBase int      // 缓冲首页的页码——视口锚点定位"锚点行在哪一页"的坐标系
 )
 
 // startAccumFrom 以 page 页为缓冲起点：只显示该页，之后滚到底继续向后追加。
@@ -784,6 +1082,7 @@ var (
 func startAccumFrom(page int) {
 	accumBase = page
 	accumBuf = []string{curBook.Current()}
+	dispStale = true
 	render(curBook.Current())
 }
 
@@ -813,11 +1112,12 @@ func vertScrollPos() int {
 // 围栏/表格可能跨页边界，按页增量会断状态——正确性优先。
 func appendPage(s string) {
 	accumBuf = append(accumBuf, s)
+	dispStale = true
 	oldPos := vertScrollPos()
 	if curIsMD {
-		te.SetText(displayText(strings.Join(accumBuf, "\n\n")))
+		te.SetText(displayText(strings.Join(accumBuf, pageJoin())))
 	} else {
-		appendTextTE(displayText("\n\n" + s))
+		appendTextTE(displayText(pageJoin() + s))
 	}
 	te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_THUMBPOSITION)|(uintptr(oldPos)<<16), 0)
 }
@@ -842,6 +1142,10 @@ func appendTextTE(text string) {
 }
 
 // appendTick 泵：到底且还有下一页 → 追加（追加后位置不在底，不会连续误触发）。
+// 进度节流落盘：翻页推进后 5 秒至多 persist 一次（原实现只靠关窗兜底，
+// 进程被杀会丢掉自上次落盘后的全部翻页；页码是 raw 口径，写的就是当前值）。
+var lastProgressPersist time.Time
+
 func appendTick() {
 	if curBook == nil || te == nil {
 		return
@@ -854,6 +1158,10 @@ func appendTick() {
 		return
 	}
 	appendPage(s)
+	if now := time.Now(); now.Sub(lastProgressPersist) >= 5*time.Second {
+		lastProgressPersist = now
+		persist()
+	}
 }
 
 // startInfiniteScroll 定时驱动 appendTick（累积式加载泵）。
@@ -890,11 +1198,13 @@ func main() {
 			ToolBar{
 				Items: []MenuItem{
 					// Image 为 rsrc 资源 ID（group icon 每个 .ico 占 2 个 ID：组=偶数，裸图=奇数）
-					// manifest=1, folder=2, font=4, first=6, prev=8, next=10, last=12, refresh=14
+					// manifest=1, folder=2, font=4, first=6, prev=8, next=10, last=12, refresh=14, encode=16
+					// 清洗设置暂无图标（icons/ 无对应 .ico，补图标后加 Image 即可）
 					Action{Text: "打开文件夹", Image: 2, OnTriggered: func() { pickAndLoad() }},
 					Action{Text: "刷新", Image: 14, OnTriggered: func() { refreshCurrent(-1) }},
 					Action{Text: "选择字体", Image: 4, OnTriggered: func() { chooseFontDlg(mw) }},
 					Action{Text: "切换编码", Image: 16, OnTriggered: func() { chooseEncodingDlg(mw) }},
+					Action{Text: "清洗设置", OnTriggered: func() { cleanOptionsDlg(mw) }},
 					Action{Text: "首页", Image: 6, OnTriggered: func() { pageFirst() }},
 					Action{Text: "上一页", Image: 8, OnTriggered: func() { pagePrev() }},
 					Action{Text: "下一页", Image: 10, OnTriggered: func() { pageNext() }},
@@ -971,8 +1281,14 @@ func main() {
 	})
 	// 命令行路径参数（README 承诺）：txtreader.exe [路径]，路径可为文件或目录。
 	// 有参数 → 直接打开该路径；无参数 → 恢复上次会话。
+	// B1：偏好（字体/行距/清洗）与窗口几何两条启动路都恢复——CLI 路径原来
+	// 整个跳过 restoreState，双击打开文件时偏好全部回默认。
+	// 卫生6：状态文件一次读取共享（原两条路各读一次）。
+	lastState, _ = loadState()
+	restorePrefs(lastState)
+	restoreWindowRect(lastState)
 	if !openCLIPath() {
-		restoreState() // 启动恢复上次会话（目录+书+页码），缺失优雅降级
+		restoreSession(lastState) // 恢复上次会话（目录+书），页码由 openAt 统一恢复
 	}
 	startInfiniteScroll(stopInfinite) // 累积式加载泵：滚到底自动追加下一页
 	mw.Run()

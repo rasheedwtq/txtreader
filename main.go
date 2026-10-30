@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/lxn/walk"
@@ -93,6 +94,39 @@ func pinyinSortKey(s string) string {
 		body = s // 纯标点文件名：退回原名，避免空键
 	}
 	return pinyinKey(body) + "\x00" + s
+}
+
+// pendingAnchor 打开后待复位的视口锚点。窗口是隐藏创建、mw.Run() 才首次显示，
+// 显示时的重新布局会把隐藏期设好的滚动位置冲掉（2026-10-30 现场：恢复瞬间
+// first=898 正确，显示后漂移）。非空时由 scheduleViewReanchor 延时复位数次。
+var pendingAnchor string
+
+// scheduleViewReanchor 在窗口首次显示/布局稳定后再对齐一次锚点（幂等）。
+// 只处理"刚打开"的短窗口期；用户一旦翻页/跳章即作废（pendingAnchor 清空）。
+func scheduleViewReanchor(anchor string) {
+	if anchor == "" || mw == nil {
+		return
+	}
+	pendingAnchor = anchor
+	go func() {
+		for _, wait := range []time.Duration{400 * time.Millisecond, 1200 * time.Millisecond} {
+			time.Sleep(wait)
+			w := mw
+			if w == nil {
+				return
+			}
+			w.Synchronize(func() {
+				if pendingAnchor == "" {
+					return
+				}
+				d := te.Text()
+				if bi := strings.Index(d, pendingAnchor); bi >= 0 {
+					scrollCaretToTop(d, len([]rune(d[:bi])))
+				}
+				pendingAnchor = ""
+			})
+		}
+	}()
 }
 
 // collectTxt 读取目录【当前层】的所有 .txt/.md（不递归子目录），按拼音排序。
@@ -224,6 +258,44 @@ func displayRuneOffset(pageText, title string) int {
 	return 0
 }
 
+// ---- 偏移口径转换（F3，2026-10-26）----
+// Win32 EDIT 消息（EM_SETSEL / EM_LINEINDEX / EM_LINEFROMCHAR）是 UTF-16
+// code unit 口径；本工程的显示偏移/锚点是 rune 口径。BMP 内两者相等，含
+// emoji / 增补平面字符后每个非 BMP 字符差 1。appendTextTE 已用
+// WM_GETTEXTLENGTH 免疫；captureView（读）与 scrollCaretToTop（写）成对收口。
+
+// runeToUTF16Off 把 s 内的 rune 偏移转为 UTF-16 code unit 偏移。
+func runeToUTF16Off(s string, runeOff int) int {
+	if runeOff <= 0 {
+		return 0
+	}
+	rs := []rune(s)
+	if runeOff > len(rs) {
+		runeOff = len(rs)
+	}
+	return len(utf16.Encode(rs[:runeOff]))
+}
+
+// utf16ToRuneOff 把 UTF-16 code unit 偏移转为 rune 偏移（截到字符边界）。
+func utf16ToRuneOff(s string, u16 int) int {
+	if u16 <= 0 {
+		return 0
+	}
+	n, i := 0, 0
+	for _, r := range s {
+		w := 1
+		if r > 0xFFFF {
+			w = 2
+		}
+		if i+w > u16 {
+			break
+		}
+		i += w
+		n++
+	}
+	return n
+}
+
 // render 套用格式后在阅读区显示文本。所有显示出口统一走这里。
 func render(s string) {
 	if te == nil {
@@ -286,8 +358,8 @@ func openAt(idx int) {
 	if remembered && restoreAnchor != "" && te != nil {
 		d := te.Text() // disp 形式（\r\n），与保存锚点时同源
 		if bi := strings.Index(d, restoreAnchor); bi >= 0 {
-			scrollCaretToTop(len([]rune(d[:bi])))
-		} else {
+			scrollCaretToTop(d, len([]rune(d[:bi])))
+			scheduleViewReanchor(restoreAnchor) // 窗口显示后可能被重新布局冲掉，延时补一次
 		}
 	}
 	showTOC()
@@ -309,11 +381,9 @@ func showCurrent() {
 }
 
 // captureView 捕捉当前视口：第一可见行的行首文字作行级书签 + 其所在页码。
-// EM_GETFIRSTVISIBLELINE 拿行号 → EM_LINEINDEX 拿行首 UTF-16 偏移 → 从
-// te.Text() 切出该行（trim 后取前 24 rune）；锚点在 accumBuf 里从后往前
-// 定位所在页（accumBase+j）。已知口径瑕疵：EM_LINEINDEX 是 UTF-16 单位，
-// 首屏前含 emoji 时 rune 切位会错（P3' 家族），最坏结果是锚点取偏 →
-// 恢复时搜不到 → 退化为页首，可接受。须在 UI 线程调用。
+// EM_GETFIRSTVISIBLELINE 拿行号 → EM_LINEINDEX 拿行首偏移（UTF-16，F3 已
+// 转回 rune）→ 从 te.Text() 切出该行（trim 后取前 24 rune）；锚点在 accumBuf
+// 里定位所在页（accumBase+j）。须在 UI 线程调用。
 func captureView() (int, string) {
 	if te == nil || curBook == nil {
 		return 0, ""
@@ -322,9 +392,12 @@ func captureView() (int, string) {
 	if first < 0 {
 		first = 0
 	}
-	charIdx := int(te.SendMessage(win.EM_LINEINDEX, uintptr(first), 0))
+	u16Idx := int(te.SendMessage(win.EM_LINEINDEX, uintptr(first), 0))
 	txt := te.Text()
 	rs := []rune(txt)
+	// F3：EM_LINEINDEX 是 UTF-16 口径，先转 rune 再切片（emoji 前有增补字符时
+	// 直接当 rune 用会错位——锚点取偏 → 恢复时搜不到 → 退化页首）。
+	charIdx := utf16ToRuneOff(txt, u16Idx)
 	if charIdx < 0 || charIdx >= len(rs) {
 		charIdx = 0
 	}
@@ -525,17 +598,21 @@ func restorePrefs(st appState) {
 }
 
 func pageNext() {
+	pendingAnchor = ""
 	if te == nil {
 		return
 	}
 	te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_PAGEDOWN), 0) // 下滚一屏，到底由加载泵追加
+	throttledPersist()                                          // L4：翻页推进即节流落盘
 }
 
 func pagePrev() {
+	pendingAnchor = ""
 	if te == nil {
 		return
 	}
 	te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_PAGEUP), 0) // 上滚一屏（前文都在缓冲里）
+	throttledPersist()                                        // L4
 }
 
 func pageFirst() {
@@ -629,6 +706,9 @@ func refreshCurrent(selectIdx int) {
 	}
 	if selectIdx >= 0 {
 		lb.SetCurrentIndex(selectIdx) // 触发 openAt 自动打开
+		// L3（2026-10-26）：同值不触发事件时兜底显式打开——openAt 有同路径
+		// 早退，重复调用无副作用。原先只靠事件，依赖 walk 的 Value 失配回落。
+		openAt(selectIdx)
 		return
 	}
 	if curBook != nil {
@@ -1021,6 +1101,7 @@ func tocJump() {
 		return
 	}
 	e := curTOC[idx]
+	pendingAnchor = ""
 	text, _, err := curBook.SeekTo(e.Offset, e.Title)
 	if err != nil {
 		return
@@ -1033,7 +1114,7 @@ func tocJump() {
 	dispStale = true
 	render(text)
 	// 美化会改变每行字符数，在显示文本里重搜标题位置，避免错行
-	scrollCaretToTop(displayRuneOffset(text, e.Title))
+	scrollCaretToTop(displayText(text), displayRuneOffset(text, e.Title))
 	if folderLbl != nil {
 		base := filepath.Dir(curBook.Path())
 		folderLbl.SetText(fmt.Sprintf("文件夹：%s（%d 篇）   当前编码：%s", base, len(curEntries), curBook.EncName()))
@@ -1041,12 +1122,14 @@ func tocJump() {
 	persist() // 章节跳转即落盘，异常退出不丢进度
 }
 
-// scrollCaretToTop 把 caret 移到页内 rune 偏移 off 处，并滚动使该行成为第一可见行，
-// 让跳转目标（章节标题）显示在阅读区第一行。
-func scrollCaretToTop(off int) {
+// scrollCaretToTop 把 caret 移到显示文本 d 内的 rune 偏移 runeOff 处，并滚动
+// 使该行成为第一可见行。F3：EM_SETSEL/EM_LINEFROMCHAR 是 UTF-16 口径，这里
+// 统一收口转换，调用方按 rune 偏移传参（与 displayRuneOffset/锚点口径一致）。
+func scrollCaretToTop(d string, runeOff int) {
 	if te == nil {
 		return
 	}
+	off := runeToUTF16Off(d, runeOff)
 	te.SendMessage(win.EM_SETSEL, uintptr(off), uintptr(off))
 	line := int32(te.SendMessage(win.EM_LINEFROMCHAR, uintptr(off), 0))
 	te.SendMessage(win.WM_VSCROLL, uintptr(win.SB_THUMBPOSITION)|(uintptr(line)<<16), 0)
@@ -1146,6 +1229,18 @@ func appendTextTE(text string) {
 // 进程被杀会丢掉自上次落盘后的全部翻页；页码是 raw 口径，写的就是当前值）。
 var lastProgressPersist time.Time
 
+// throttledPersist 节流落盘（L4，2026-10-26）：键盘/工具栏翻页与加载泵共用，
+// 5 秒至多一次；跳转/关窗等显式 persist 不走节流（必须立刻落盘）。
+func throttledPersist() {
+	if curBook == nil {
+		return
+	}
+	if now := time.Now(); now.Sub(lastProgressPersist) >= 5*time.Second {
+		lastProgressPersist = now
+		persist()
+	}
+}
+
 func appendTick() {
 	if curBook == nil || te == nil {
 		return
@@ -1158,10 +1253,7 @@ func appendTick() {
 		return
 	}
 	appendPage(s)
-	if now := time.Now(); now.Sub(lastProgressPersist) >= 5*time.Second {
-		lastProgressPersist = now
-		persist()
-	}
+	throttledPersist()
 }
 
 // startInfiniteScroll 定时驱动 appendTick（累积式加载泵）。

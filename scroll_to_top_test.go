@@ -39,10 +39,13 @@ func TestScrollCaretToTop(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("目标行不存在")
 	}
-	off := len([]rune(sb.String()[:idx]))
-	scrollCaretToTop(off)
+	d := sb.String()
+	off := len([]rune(d[:idx]))
+	scrollCaretToTop(d, off)
 
-	line := int(te.SendMessage(win.EM_LINEFROMCHAR, uintptr(off), 0))
+	// F3：校验也用 UTF-16 口径（EM_LINEFROMCHAR 同源），否则含 emoji 时
+	// 测试自己会把口径混用传下去
+	line := int(te.SendMessage(win.EM_LINEFROMCHAR, uintptr(runeToUTF16Off(d, off)), 0))
 	first := int(te.SendMessage(win.EM_GETFIRSTVISIBLELINE, 0, 0))
 	if first != line {
 		t.Fatalf("目标行应在第一行：first=%d line=%d", first, line)

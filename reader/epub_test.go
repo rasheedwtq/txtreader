@@ -10,7 +10,7 @@ import (
 )
 
 // buildTestEpub 手工打包一本最小 EPUB（mimetype/container/opf/两章正文/nav/ncx）。
-// encrypt=true 时附带 META-INF/encryption.xml（模拟 DRM 标记）。
+// encrypt=true 时附带 META-INF/encryption.xml 且指向内容文档（真 DRM，F1 口径）。
 // withTOC=false 时不放 nav/ncx（测规则库回落）。
 func buildTestEpub(t *testing.T, withTOC, encrypt bool) string {
 	t.Helper()
@@ -95,8 +95,15 @@ func buildTestEpub(t *testing.T, withTOC, encrypt bool) string {
 	}
 
 	if encrypt {
+		// F1 口径（2026-10-26）：真 DRM = 内容文档被加密；空 EncryptedData /
+		// 字体混淆都不再算 DRM，构造必须指向 ch1.xhtml
 		add("META-INF/encryption.xml", `<?xml version="1.0"?>
-<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><enc:EncryptedData/></encryption>`)
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container" xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData>
+    <enc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/>
+    <enc:CipherData><enc:CipherReference URI="OEBPS/ch1.xhtml"/></enc:CipherData>
+  </enc:EncryptedData>
+</encryption>`)
 	}
 
 	if err := w.Close(); err != nil {

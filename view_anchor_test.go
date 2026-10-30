@@ -74,7 +74,7 @@ func TestViewAnchorRestore(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("锚点行不在显示文本里")
 	}
-	scrollCaretToTop(len([]rune(d[:idx])))
+	scrollCaretToTop(d, len([]rune(d[:idx])))
 
 	// 落盘：应记下 ViewPage=1 + 锚点
 	persist()
@@ -167,7 +167,7 @@ func TestCaptureViewSinglePage(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("目标行不存在")
 	}
-	scrollCaretToTop(len([]rune(d[:idx])))
+	scrollCaretToTop(d, len([]rune(d[:idx])))
 	vp, anchor := captureView()
 	if vp != 0 {
 		t.Fatalf("短篇 ViewPage 应为 0，got %d", vp)
@@ -250,7 +250,7 @@ func TestCaptureViewBlankFirstLine(t *testing.T) {
 	if idx < 0 {
 		t.Fatal("目标不存在")
 	}
-	scrollCaretToTop(len([]rune(d[:idx])) + len([]rune("第一段。")) + 2)
+	scrollCaretToTop(d, len([]rune(d[:idx]))+len([]rune("第一段。"))+2)
 	vp, anchor := captureView()
 	if vp != 0 {
 		t.Fatalf("ViewPage 应为 0，got %d", vp)
@@ -310,7 +310,7 @@ func TestCaptureViewMDTableRow(t *testing.T) {
 	if idx < 0 {
 		t.Fatalf("SECI 行不在显示文本里（md 美化路径异常），d 前 200 字=%q", []rune(d[:200]))
 	}
-	scrollCaretToTop(len([]rune(d[:idx])))
+	scrollCaretToTop(d, len([]rune(d[:idx])))
 	vp, anchor := captureView()
 	if anchor == "" {
 		t.Fatal("表格行锚点被丢成空（Contains 匹配回归？）")

@@ -24,8 +24,17 @@ import (
 	xhtml "golang.org/x/net/html"
 )
 
-// errEncrypted EPUB 带 DRM 加密（META-INF/encryption.xml），明确不支持。
+// errEncrypted EPUB 正文被 DRM 加密，明确不支持。
+// 注：META-INF/encryption.xml 还有合法的字体混淆用途（见 checkEncryption），
+// 不能见文件就拒（F1，2026-10-26 审查）。
 var errEncrypted = errors.New("该 EPUB 已加密（DRM 保护），暂不支持阅读")
+
+// fontObfuscationAlgos 字体混淆算法 URI——只混淆嵌入字体字节，正文完全可读。
+// IDPF/EPUB3 与 Adobe 两套标准算法（Calibre「嵌入字体」、Sigil、正式出版物常见）。
+var fontObfuscationAlgos = map[string]bool{
+	"http://www.idpf.org/2008/embedding": true,
+	"http://ns.adobe.com/pdf/enc#RC":     true,
+}
 
 // EpubContent 解包后的 EPUB 纯文本内容。
 type EpubContent struct {
@@ -51,11 +60,11 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 	}
 	defer e.Close()
 
-	// 加密检测：pirmd 不做，自己扫（有 encryption.xml 一律视为 DRM/加密）
-	for _, f := range e.File {
-		if strings.EqualFold(f.Name, "META-INF/encryption.xml") {
-			return nil, errEncrypted
-		}
+	// 加密检测（F1 修正，2026-10-26）：encryption.xml 合法用途包括字体混淆——
+	// 只有「内容文档（xhtml/html）被加密」才是 DRM 拒绝；字体/图片等资源被
+	// 混淆不影响正文阅读，必须放行。
+	if err := checkEncryption(e); err != nil {
+		return nil, err
 	}
 
 	opf, err := e.Package()
@@ -119,7 +128,10 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 		}
 		txt := strings.TrimSpace(htmlToText(strings.NewReader(raw), imgPlaceholder))
 		if txt == "" {
-			continue // 空章节（封面页等）不入正文流
+			// F4（2026-10-26）：空章节（封面/扉页）也登记起点——TOC 指向它时
+			// 条目不再静默消失，偏移落在下一段实际内容（或文件尾）。
+			itemStart[itemKey(opfDir, it.href)] = runes
+			continue // 空章节不入正文流
 		}
 		if n > 0 {
 			sb.WriteString("\n\n")
@@ -166,6 +178,65 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 // rel 可以是 opf 相对路径，也可以是已根化的路径（path.Join 幂等处理）。
 func itemKey(opfDir, rel string) string {
 	return path.Clean(path.Join(opfDir, normHref(rel)))
+}
+
+// checkEncryption 分析 META-INF/encryption.xml：只对「内容文档被加密」报
+// errEncrypted。字体混淆（IDPF/Adobe embedding 算法）与非内容资源（字体/
+// 图片/音频等）的加密不影响纯文本阅读，一律放行（F1，2026-10-26 探针实锤：
+// 此前见文件即拒，Calibre 嵌入字体的正版书整本打不开）。
+// 无 encryption.xml 或解析失败（野格式）→ 放行，交给正文提取自然报错。
+func checkEncryption(e *epub.Epub) error {
+	for _, f := range e.File {
+		if normZipName(f.Name) != "/META-INF/encryption.xml" {
+			continue
+		}
+		r, err := f.Open()
+		if err != nil {
+			return nil // 读不出就当没有，别把可读书误杀
+		}
+		b, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			return nil
+		}
+		var doc struct {
+			EncryptedData []struct {
+				EncryptionMethod struct {
+					Algorithm string `xml:"Algorithm,attr"`
+				} `xml:"EncryptionMethod"`
+				CipherData struct {
+					CipherReference struct {
+						URI string `xml:"URI,attr"`
+					} `xml:"CipherReference"`
+				} `xml:"CipherData"`
+			} `xml:"EncryptedData"`
+		}
+		if err := xml.Unmarshal(b, &doc); err != nil {
+			return nil // 野格式解析失败：放行
+		}
+		for _, ed := range doc.EncryptedData {
+			algo := ed.EncryptionMethod.Algorithm
+			if fontObfuscationAlgos[algo] {
+				continue // 字体混淆，正文可读
+			}
+			if isContentDocURI(ed.CipherData.CipherReference.URI) {
+				return errEncrypted // 内容文档被真加密（DRM）
+			}
+		}
+		return nil // 有 encryption.xml 但没锁正文：放行
+	}
+	return nil
+}
+
+// isContentDocURI 判断 CipherReference URI 是否指向内容文档（xhtml/html）。
+// URI 是相对包根的路径，可能带 fragment / URL 编码。
+func isContentDocURI(uri string) bool {
+	if uri == "" {
+		return false
+	}
+	h := normHref(uri) // 剥 fragment + 解码 + 根化
+	ext := strings.ToLower(path.Ext(h))
+	return ext == ".xhtml" || ext == ".html" || ext == ".htm" || ext == ".xml"
 }
 
 // findOPFDir 从 META-INF/container.xml 解出 OPF 所在目录（根化，如 /OEBPS）。
@@ -317,8 +388,9 @@ type ncxContent struct {
 	Src string `xml:"src,attr"`
 }
 
-// parseNav 解析 EPUB3 nav.xhtml（properties="nav"）：取第一个 <nav>，
-// 递归展平 ol>li>a 嵌套。
+// parseNav 解析 EPUB3 nav.xhtml（properties="nav"）：优先取 <nav epub:type="toc">，
+// 全不中再退回第一个 <nav>（F2，2026-10-26 探针实锤：landmarks/page-list 排在
+// toc 之前时旧逻辑取错 nav，目录栏变成地标条目）。取到后递归展平 ol>li>a 嵌套。
 func parseNav(e *epub.Epub, opfDir, navHref string) []tocEntryRaw {
 	raw, err := readZipItem(e, opfDir, navHref)
 	if err != nil {
@@ -328,21 +400,36 @@ func parseNav(e *epub.Epub, opfDir, navHref string) []tocEntryRaw {
 	if err != nil {
 		return nil
 	}
-	var nav *xhtml.Node
+	var tocNav, firstNav *xhtml.Node
 	var findNav func(n *xhtml.Node)
 	findNav = func(n *xhtml.Node) {
-		if nav != nil {
+		if tocNav != nil {
 			return
 		}
 		if n.Type == xhtml.ElementNode && n.Data == "nav" {
-			nav = n
-			return
+			if firstNav == nil {
+				firstNav = n
+			}
+			// epub:type 可能是 "toc" 或 "toc xxx"（空格分隔多值）；HTML 解析器
+			// 保留字面前缀属性名（epub:type），两种写法都认。
+			if v := strings.ToLower(attrOf(n, "epub:type")); v != "" {
+				for _, f := range strings.Fields(v) {
+					if f == "toc" {
+						tocNav = n
+						return
+					}
+				}
+			}
 		}
-		for c := n.FirstChild; c != nil && nav == nil; c = c.NextSibling {
+		for c := n.FirstChild; c != nil && tocNav == nil; c = c.NextSibling {
 			findNav(c)
 		}
 	}
 	findNav(doc)
+	nav := tocNav
+	if nav == nil {
+		nav = firstNav // 无 epub:type="toc"：退回第一个 nav（旧格式容错）
+	}
 	if nav == nil {
 		return nil
 	}

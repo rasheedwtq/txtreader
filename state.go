@@ -71,6 +71,10 @@ func loadState() (appState, bool) {
 }
 
 // saveState 写入状态；任何错误静默忽略（状态丢失不应影响阅读）。
+// 原子写（2026-11-06 卫生项）：直接 os.WriteFile 覆盖时若进程在写一半被杀，
+// 会留下半截 JSON，下次 loadState 解析失败 → 偏好与进度全丢。改成先写临时
+// 文件再 os.Rename 覆盖（Windows 上 rename 可替换已存在文件，已实测）。
+// rename 万一失败则退回直写，至少不丢状态，并清掉临时文件。
 func saveState(st appState) {
 	p, err := statePath()
 	if err != nil {
@@ -80,5 +84,12 @@ func saveState(st appState) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(p, b, 0644)
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.WriteFile(p, b, 0644)
+		_ = os.Remove(tmp)
+	}
 }

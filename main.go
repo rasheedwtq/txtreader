@@ -96,34 +96,67 @@ func pinyinSortKey(s string) string {
 	return pinyinKey(body) + "\x00" + s
 }
 
-// pendingAnchor 打开后待复位的视口锚点。窗口是隐藏创建、mw.Run() 才首次显示，
-// 显示时的重新布局会把隐藏期设好的滚动位置冲掉（2026-10-30 现场：恢复瞬间
-// first=898 正确，显示后漂移）。非空时由 scheduleViewReanchor 延时复位数次。
-var pendingAnchor string
+// ---- 启动恢复的视口复位（2026-10-30 漂移修复 + 2026-11-06 G2/G3 加固）----
+// 窗口隐藏创建、mw.Run() 才首次显示；显示时的重新布局会把隐藏期设好的滚动
+// 位置冲掉。pendingAnchor 记着待复位的锚点，scheduleViewReanchor 在显示后
+// 按绝对时间点复核两次；用户一旦滚动/跳章/换书即整体作废。
+//
+// 所有状态读写都在 UI 线程：scheduleViewReanchor 只负责定时把回调入队，回调
+// 由 walk 消息循环在 UI 线程执行；invalidateReanchor 的调用点也都在 UI 线程。
+var (
+	pendingAnchor     string
+	pendingAnchorPath string // 锚点所属的书：换书后旧回调不得干扰新书
+	reanchorGen       uint64 // 代次：作废 / 新调度都会递增，旧 goroutine 自动失效
+)
 
-// scheduleViewReanchor 在窗口首次显示/布局稳定后再对齐一次锚点（幂等）。
-// 只处理"刚打开"的短窗口期；用户一旦翻页/跳章即作废（pendingAnchor 清空）。
+// invalidateReanchor 作废在途的复位：清空锚点并推进代次，使所有旧 goroutine
+// 尚未执行的回调在 gen 校验处直接返回。用户滚动（含 EDIT 直达的滚轮消息）、
+// 翻页/跳章/首页末页、字体/编码/清洗重渲染、换书，都必须走这里。
+func invalidateReanchor() {
+	pendingAnchor = ""
+	pendingAnchorPath = ""
+	reanchorGen++
+}
+
+// scheduleViewReanchor 在窗口首次显示/布局稳定后按 400ms / 1200ms 两个绝对
+// 时间点各对齐一次（幂等）。G2（2026-11-06）：此前第一次回调末尾就无条件
+// 清空 pendingAnchor，第二次回调必然 no-op，"复位数次"名存实亡；Sleep 串行
+// 累加还把第二次推到了 1600ms。现在锚点只在最后一次复核或用户作废时清空。
 func scheduleViewReanchor(anchor string) {
-	if anchor == "" || mw == nil {
+	if anchor == "" || mw == nil || curBook == nil {
 		return
 	}
-	pendingAnchor = anchor
+	reanchorGen++
+	gen := reanchorGen
+	path := curBook.Path()
+	pendingAnchor, pendingAnchorPath = anchor, path
+	start := time.Now()
+	stops := []time.Duration{400 * time.Millisecond, 1200 * time.Millisecond}
 	go func() {
-		for _, wait := range []time.Duration{400 * time.Millisecond, 1200 * time.Millisecond} {
-			time.Sleep(wait)
+		for i, at := range stops {
+			if wait := at - time.Since(start); wait > 0 {
+				time.Sleep(wait)
+			}
 			w := mw
 			if w == nil {
 				return
 			}
+			last := i == len(stops)-1
 			w.Synchronize(func() {
-				if pendingAnchor == "" {
+				if gen != reanchorGen || pendingAnchor == "" {
+					return // 已被用户作废，或已被新一次打开取代
+				}
+				if te == nil || curBook == nil || curBook.Path() != pendingAnchorPath {
+					invalidateReanchor()
 					return
 				}
 				d := te.Text()
 				if bi := strings.Index(d, pendingAnchor); bi >= 0 {
 					scrollCaretToTop(d, len([]rune(d[:bi])))
 				}
-				pendingAnchor = ""
+				if last {
+					invalidateReanchor() // 复核周期结束，释放锚点
+				}
 			})
 		}
 	}()
@@ -315,6 +348,9 @@ func openAt(idx int) {
 	if curBook != nil && curBook.Path() == curEntries[idx].path {
 		return
 	}
+	// G3：真正换书了，上本书在途的复位立即作废（refreshCurrent 的显式
+	// openAt 兜底走同路径早退，不会误伤本次刚调度的复位）。
+	invalidateReanchor()
 	if curBook != nil {
 		curBook.Close()
 		curBook = nil
@@ -359,13 +395,21 @@ func openAt(idx int) {
 		d := te.Text() // disp 形式（\r\n），与保存锚点时同源
 		if bi := strings.Index(d, restoreAnchor); bi >= 0 {
 			scrollCaretToTop(d, len([]rune(d[:bi])))
-			scheduleViewReanchor(restoreAnchor) // 窗口显示后可能被重新布局冲掉，延时补一次
+			scheduleViewReanchor(restoreAnchor) // 窗口显示后可能被重新布局冲掉，延时复核两次
+			// G1（2026-11-06）：showCurrent 在上面已 persist 过一次，那时视口
+			// 还在文档顶部，把 ViewAnchor 写成了页首 24 字。这里按对齐后的位置
+			// 重写，并直接用已知锚点覆盖——隐藏期 EM_GETFIRSTVISIBLELINE 不
+			// 一定可信（10-30 教训），不能再依赖 captureView 读回锚点。
+			persistWithAnchor(restoreAnchor)
 		}
 	}
 	showTOC()
 }
 
 func showCurrent() {
+	// G3：字体/编码/清洗对话框经这里重渲染，在途复位必须作废。恢复路径里
+	// openAt 是先 showCurrent、后 scheduleViewReanchor，顺序保证不会自杀。
+	invalidateReanchor()
 	if curBook == nil {
 		return
 	}
@@ -480,7 +524,12 @@ func dispPageOf(off int) int {
 }
 
 // persist 把当前会话状态写到 exe 同目录的 txtreader.state.json。
-func persist() {
+func persist() { persistWithAnchor("") }
+
+// persistWithAnchor 与 persist 相同，但允许调用方指定已知的行级锚点。
+// G1：启动恢复完成后用 restoreAnchor 覆盖 ViewAnchor，不依赖隐藏窗口里
+// 再次 captureView（第一可见行在显示前不可靠）。
+func persistWithAnchor(anchor string) {
 	st := appState{
 		LastDir:       curDir,
 		FontFamily:    curFamily,
@@ -494,6 +543,9 @@ func persist() {
 		st.CurrentPath = curBook.Path()
 		st.Page = curBook.Page()
 		st.ViewPage, st.ViewAnchor = captureView() // 行级书签：第一可见行（UI 线程）
+		if anchor != "" {
+			st.ViewAnchor = anchor
+		}
 	}
 	if mw != nil { // 测试环境可能无主窗（全局 mw 被 makeTestWindow 遮蔽）
 		saveWindowRect(&st)
@@ -598,7 +650,7 @@ func restorePrefs(st appState) {
 }
 
 func pageNext() {
-	pendingAnchor = ""
+	invalidateReanchor()
 	if te == nil {
 		return
 	}
@@ -607,7 +659,7 @@ func pageNext() {
 }
 
 func pagePrev() {
-	pendingAnchor = ""
+	invalidateReanchor()
 	if te == nil {
 		return
 	}
@@ -616,6 +668,7 @@ func pagePrev() {
 }
 
 func pageFirst() {
+	invalidateReanchor() // G3：显式跳转不能被延时复位拽回
 	if curBook == nil {
 		return
 	}
@@ -626,6 +679,7 @@ func pageFirst() {
 }
 
 func pageLast() {
+	invalidateReanchor() // G3：显式跳转不能被延时复位拽回
 	if curBook == nil {
 		return
 	}
@@ -823,6 +877,7 @@ func chooseFontDlg(owner walk.Form) {
 	var dlg *walk.Dialog
 	// 在 OnClicked（Accept 之前）读值——对话框关闭后 ComboBox 状态会被重置
 	picked := func() {
+		invalidateReanchor() // G3：字体/行距变化会重灌全文并复位滚动位置
 		if i := familyCB.CurrentIndex(); i >= 0 {
 			curFamily = families[i]
 		}
@@ -1101,7 +1156,7 @@ func tocJump() {
 		return
 	}
 	e := curTOC[idx]
-	pendingAnchor = ""
+	invalidateReanchor()
 	text, _, err := curBook.SeekTo(e.Offset, e.Title)
 	if err != nil {
 		return
@@ -1129,6 +1184,10 @@ func scrollCaretToTop(d string, runeOff int) {
 	if te == nil {
 		return
 	}
+	// G3：程序化对齐会发 WM_VSCROLL，别让控件钩子把它当成用户滚动而作废掉
+	// reanchor 自己（否则第一次复核发出的消息会掐断第二次复核）。
+	suppressScrollInvalidate = true
+	defer func() { suppressScrollInvalidate = false }()
 	off := runeToUTF16Off(d, runeOff)
 	te.SendMessage(win.EM_SETSEL, uintptr(off), uintptr(off))
 	line := int32(te.SendMessage(win.EM_LINEFROMCHAR, uintptr(off), 0))
@@ -1360,6 +1419,9 @@ func main() {
 		walk.MsgBox(nil, "初始化失败", err.Error(), walk.MsgBoxIconError)
 		return
 	}
+	// G3：EDIT 的滚轮/滚动条/键盘滚动消息直达控件，装子类钩子才能作废在途
+	// 的启动复位，避免把用户刚滚到的位置拽回锚点。
+	installScrollHook()
 	// 书列表 : 目录栏 : 阅读区 = 1 : 1 : 5（目录栏默认隐藏，showTOC 显示时占 1）
 	if ss, ok := hs.Layout().(stretchSetter); ok {
 		_ = ss.SetStretchFactor(lb, 1)
@@ -1369,6 +1431,7 @@ func main() {
 	stopInfinite := make(chan struct{})
 	mw.Closing().Attach(func(cancel *bool, reason walk.CloseReason) {
 		persist()
+		uninstallScrollHook()
 		close(stopInfinite)
 	})
 	// 命令行路径参数（README 承诺）：txtreader.exe [路径]，路径可为文件或目录。

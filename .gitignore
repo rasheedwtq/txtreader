@@ -3,10 +3,14 @@ txtreader.exe
 
 # State / runtime data
 *.state.json
+*.state.json.tmp
 
 # Test artifacts
 *.txt
 *.log
+
+# Stale editor backups (accidentally tracked in older commits)
+*.bak
 
 # Go cache (keep go.mod/go.sum)
 vendor/

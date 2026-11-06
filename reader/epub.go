@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/pirmd/epub"
@@ -28,13 +29,6 @@ import (
 // 注：META-INF/encryption.xml 还有合法的字体混淆用途（见 checkEncryption），
 // 不能见文件就拒（F1，2026-10-26 审查）。
 var errEncrypted = errors.New("该 EPUB 已加密（DRM 保护），暂不支持阅读")
-
-// fontObfuscationAlgos 字体混淆算法 URI——只混淆嵌入字体字节，正文完全可读。
-// IDPF/EPUB3 与 Adobe 两套标准算法（Calibre「嵌入字体」、Sigil、正式出版物常见）。
-var fontObfuscationAlgos = map[string]bool{
-	"http://www.idpf.org/2008/embedding": true,
-	"http://ns.adobe.com/pdf/enc#RC":     true,
-}
 
 // EpubContent 解包后的 EPUB 纯文本内容。
 type EpubContent struct {
@@ -60,16 +54,28 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 	}
 	defer e.Close()
 
-	// 加密检测（F1 修正，2026-10-26）：encryption.xml 合法用途包括字体混淆——
-	// 只有「内容文档（xhtml/html）被加密」才是 DRM 拒绝；字体/图片等资源被
-	// 混淆不影响正文阅读，必须放行。
-	if err := checkEncryption(e); err != nil {
-		return nil, err
-	}
-
+	// G5（2026-11-06）：加密检测要按 OPF manifest 的 media-type 判「内容文档」
+	// （EPUB 规范里扩展名可以任意），所以 Package / findOPFDir 必须先跑完。
+	// 顺序变化只影响「OPF 本身损坏且带 encryption.xml」的野书报错措辞。
 	opf, err := e.Package()
+	looseTitle, looseAuthor := "", ""
 	if err != nil {
-		return nil, fmt.Errorf("EPUB 结构损坏（OPF 解析失败）：%w", err)
+		// 宽容兜底（2026-11-06 现场）：epubBuilder 2.5.x 等老式生成器把
+		// xmlns 拼成 mlns，<package> 没有命名空间；pirmd 的 Package() 严格
+		// 校验命名空间会直接失败。这类书的 manifest/spine 本身是好的，只是
+		// 根元素命名空间不合规（书库抽样 600 本里 598 本是这个形态），
+		// 用不约束命名空间的自解析补上，让整批书照常可读。
+		opfRel, pErr := findOPFPath(e)
+		if pErr == nil {
+			var t, a string
+			opf, t, a, err = parseOPFLoose(e, opfRel)
+			if err == nil {
+				looseTitle, looseAuthor = t, a
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("EPUB 结构损坏（OPF 解析失败）：%w", err)
+		}
 	}
 	if opf.Spine == nil || len(opf.Spine.Itemrefs) == 0 {
 		return nil, errors.New("EPUB 缺少 spine（无阅读顺序），无法打开")
@@ -78,17 +84,25 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 只有「内容文档被加密」才报 DRM；字体混淆 / 图片 / NCX 等资源被加密
+	// 不影响正文阅读，一律放行。
+	if err := checkEncryption(e, opf, opfDir); err != nil {
+		return nil, err
+	}
 
 	// manifest：id → 条目；顺便定位 NCX（EPUB2）与 nav（EPUB3）
 	type mItem struct{ href, mediaType, properties string }
 	manifest := make(map[string]mItem, len(opf.Manifest.Items))
 	ncxHref, navHref := "", ""
 	for _, it := range opf.Manifest.Items {
-		manifest[it.ID] = mItem{href: it.Href, mediaType: it.MediaType, properties: it.Properties}
-		if it.MediaType == "application/x-dtbncx+xml" {
+		// media-type 允许带 "; charset=utf-8" 之类参数，取分号前的主类型。
+		// 否则 spine 提取会把这类合法正文条目整个跳过（G5 顺带修复）。
+		mt := strings.ToLower(strings.TrimSpace(strings.SplitN(it.MediaType, ";", 2)[0]))
+		manifest[it.ID] = mItem{href: it.Href, mediaType: mt, properties: it.Properties}
+		if mt == "application/x-dtbncx+xml" {
 			ncxHref = it.Href
 		}
-		if strings.Contains(it.Properties, "nav") && strings.EqualFold(it.MediaType, "application/xhtml+xml") {
+		if strings.Contains(it.Properties, "nav") && mt == "application/xhtml+xml" {
 			navHref = it.Href
 		}
 	}
@@ -108,10 +122,23 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 			ec.Author = strings.TrimSpace(info.Creator[0].FullName)
 		}
 	}
+	// 兜底路径下 pirmd 的 Information() 也会因命名空间失败，书名/作者用
+	// 自解析 OPF 的 dc:title / dc:creator 补上。
+	if ec.Title == "" {
+		ec.Title = looseTitle
+	}
+	if ec.Author == "" {
+		ec.Author = looseAuthor
+	}
 
 	var sb strings.Builder
 	runes := 0
 	itemStart := make(map[string]int, len(opf.Spine.Itemrefs))
+	itemAnchors := make(map[string]map[string]int, len(opf.Spine.Itemrefs)) // G4：文件键 → id → 章节内 rune 偏移
+	// G6：空章节先暂存，spine 扫完再决定登记与否（单遍扫描时不知道后面
+	// 还有没有正文）。文末空章节若登记，offset 会等于 len(Text)，SeekTo
+	// 钳回首页 → 目录里留个点了没反应、与首章重合的假条目。
+	pendingEmpty := make(map[string]int)
 	n := 0
 	for _, ref := range opf.Spine.Itemrefs {
 		it, ok := manifest[ref.IDref]
@@ -126,18 +153,32 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 		if err != nil {
 			continue // 单章读取失败：跳过，宁缺勿崩
 		}
-		txt := strings.TrimSpace(htmlToText(strings.NewReader(raw), imgPlaceholder))
+		key := itemKey(opfDir, it.href)
+		rawText, anchors := htmlToTextWithAnchors(strings.NewReader(raw), imgPlaceholder)
+		txt := strings.TrimSpace(rawText)
+		// G4：锚点偏移按 htmlToText 的原始输出记录，TrimSpace 削掉的前导空白
+		// 必须同步扣掉，否则 fragment 落点整体前移。
+		if lead := utf8.RuneCountInString(rawText) - utf8.RuneCountInString(strings.TrimLeftFunc(rawText, unicode.IsSpace)); lead > 0 {
+			for id, off := range anchors {
+				if off > lead {
+					anchors[id] = off - lead
+				} else {
+					anchors[id] = 0
+				}
+			}
+		}
 		if txt == "" {
-			// F4（2026-10-26）：空章节（封面/扉页）也登记起点——TOC 指向它时
-			// 条目不再静默消失，偏移落在下一段实际内容（或文件尾）。
-			itemStart[itemKey(opfDir, it.href)] = runes
+			// F4（2026-10-26）：空章节（封面/扉页）也要让 TOC 条目有落点。
+			// G6：但登记要推迟到扫描结束——只有「其后还有正文写入」才有效。
+			pendingEmpty[key] = runes
 			continue // 空章节不入正文流
 		}
 		if n > 0 {
 			sb.WriteString("\n\n")
 			runes += 2
 		}
-		itemStart[itemKey(opfDir, it.href)] = runes
+		itemStart[key] = runes
+		itemAnchors[key] = anchors
 		sb.WriteString(txt)
 		runes += utf8.RuneCountInString(txt)
 		n++
@@ -146,6 +187,13 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 		return nil, errors.New("EPUB 内没有可读的正文内容")
 	}
 	ec.Text = sb.String()
+	// G6：首部/中间空章节（off < runes）按 F4 保留，落在下一段实际内容；
+	// 尾部空章节（off == runes）丢弃条目，避免出现指向文末之后的假目录项。
+	for key, off := range pendingEmpty {
+		if off < runes {
+			itemStart[key] = off
+		}
+	}
 
 	// ---- TOC：EPUB3 nav 优先，EPUB2 NCX 兜底 ----
 	// 目录 href 相对于其所属文件（nav.xhtml / toc.ncx）所在目录，归一到与
@@ -164,12 +212,23 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 		// E1（2026-10-23 审查）：baseDir 已是 TOC 文件所在目录（根化），直接拼
 		// href 即可——此前多套一层 path.Dir 把 TOC 自身目录剥掉，TOC 文件在
 		// OPF 子目录时条目静默全丢（同目录形态恰好抵消，自测没暴露）。
-		key := itemKey(opfDir, path.Join(baseDir, t.href))
-		if off, ok := itemStart[key]; ok {
-			ec.Toc = append(ec.Toc, TocEntry{
-				Title: strings.TrimSpace(t.title), Offset: off, Level: t.level,
-			})
+		// G4（2026-11-06）：fragment 必须在这一层单独拆。normHref 被 itemKey
+		// 与 readZipItem 共用，改成保留 # 会让 E1 口径回潮；这里拆完再按
+		// 「章节起点 + id 在章节内的偏移」精确定位，找不到 id 时退回章首。
+		hrefPath, frag := splitHref(t.href)
+		key := itemKey(opfDir, path.Join(baseDir, hrefPath))
+		off, ok := itemStart[key]
+		if !ok {
+			continue
 		}
+		if frag != "" {
+			if a, ok := itemAnchors[key][frag]; ok {
+				off += a
+			}
+		}
+		ec.Toc = append(ec.Toc, TocEntry{
+			Title: strings.TrimSpace(t.title), Offset: off, Level: t.level,
+		})
 	}
 	return ec, nil
 }
@@ -180,12 +239,29 @@ func itemKey(opfDir, rel string) string {
 	return path.Clean(path.Join(opfDir, normHref(rel)))
 }
 
+// splitHref 拆出 fragment（G4）。只在这里拆：路径部分仍交给 normHref 做
+// 解码 + 根化，fragment 单独解码；normHref / itemKey / readZipItem 的口径
+// 一个字都不动，避免 E1 的 OPF 子目录回归。
+func splitHref(h string) (string, string) {
+	if i := strings.IndexByte(h, '#'); i >= 0 {
+		frag := h[i+1:]
+		if d, err := url.PathUnescape(frag); err == nil {
+			frag = d
+		}
+		return h[:i], frag
+	}
+	return h, ""
+}
+
 // checkEncryption 分析 META-INF/encryption.xml：只对「内容文档被加密」报
-// errEncrypted。字体混淆（IDPF/Adobe embedding 算法）与非内容资源（字体/
-// 图片/音频等）的加密不影响纯文本阅读，一律放行（F1，2026-10-26 探针实锤：
-// 此前见文件即拒，Calibre 嵌入字体的正版书整本打不开）。
-// 无 encryption.xml 或解析失败（野格式）→ 放行，交给正文提取自然报错。
-func checkEncryption(e *epub.Epub) error {
+// errEncrypted。G5（2026-11-06）：内容文档按 OPF manifest 的 media-type 判定，
+// 不再看扩展名——规范允许正文用 .xht / 无扩展名，也允许非正文资源叫 .xml
+// （旧口径把 .xml 一律当正文，rights.xml / toc.xml 被加密时正文可读却整本
+// 拒绝）。算法字段不再参与判定：字体混淆的合法性由「目标不是内容文档」保证，
+// 把字体混淆算法写在正文条目上的异常样本必须拒绝。
+// 无 encryption.xml / 解析失败（野格式）/ manifest 无内容文档条目 → 放行或
+// 退回扩展名兜底，交给正文提取自然报错。
+func checkEncryption(e *epub.Epub, opf *epub.PackageDocument, opfDir string) error {
 	for _, f := range e.File {
 		if normZipName(f.Name) != "/META-INF/encryption.xml" {
 			continue
@@ -201,9 +277,6 @@ func checkEncryption(e *epub.Epub) error {
 		}
 		var doc struct {
 			EncryptedData []struct {
-				EncryptionMethod struct {
-					Algorithm string `xml:"Algorithm,attr"`
-				} `xml:"EncryptionMethod"`
 				CipherData struct {
 					CipherReference struct {
 						URI string `xml:"URI,attr"`
@@ -214,13 +287,10 @@ func checkEncryption(e *epub.Epub) error {
 		if err := xml.Unmarshal(b, &doc); err != nil {
 			return nil // 野格式解析失败：放行
 		}
+		contentDocs := manifestContentDocs(opf, opfDir)
 		for _, ed := range doc.EncryptedData {
-			algo := ed.EncryptionMethod.Algorithm
-			if fontObfuscationAlgos[algo] {
-				continue // 字体混淆，正文可读
-			}
-			if isContentDocURI(ed.CipherData.CipherReference.URI) {
-				return errEncrypted // 内容文档被真加密（DRM）
+			if isEncryptedContentDoc(ed.CipherData.CipherReference.URI, contentDocs, opfDir) {
+				return errEncrypted
 			}
 		}
 		return nil // 有 encryption.xml 但没锁正文：放行
@@ -228,45 +298,159 @@ func checkEncryption(e *epub.Epub) error {
 	return nil
 }
 
-// isContentDocURI 判断 CipherReference URI 是否指向内容文档（xhtml/html）。
-// URI 是相对包根的路径，可能带 fragment / URL 编码。
+// manifestContentDocs 收集 OPF manifest 里 media-type 为内容文档的条目键。
+// media-type 可能带 "; charset=utf-8" 之类参数，取分号前的主类型。
+func manifestContentDocs(opf *epub.PackageDocument, opfDir string) map[string]bool {
+	keys := make(map[string]bool)
+	if opf == nil {
+		return keys
+	}
+	for _, it := range opf.Manifest.Items {
+		mt := strings.ToLower(strings.TrimSpace(strings.SplitN(it.MediaType, ";", 2)[0]))
+		if mt != "application/xhtml+xml" && mt != "text/html" {
+			continue
+		}
+		keys[itemKey(opfDir, it.Href)] = true
+	}
+	return keys
+}
+
+// isEncryptedContentDoc 判断 CipherReference 是否指向内容文档。
+// 规范上 URI 相对包根；少数生成器写成相对 OPF 目录，两种口径都试。
+// manifest 里没有内容文档条目时退回扩展名兜底（野格式容错）。
+func isEncryptedContentDoc(uri string, contentDocs map[string]bool, opfDir string) bool {
+	if uri == "" {
+		return false
+	}
+	if len(contentDocs) > 0 {
+		if contentDocs[normHref(uri)] {
+			return true
+		}
+		return contentDocs[itemKey(opfDir, uri)]
+	}
+	return isContentDocURI(uri)
+}
+
+// isContentDocURI 扩展名兜底（仅在 manifest 无内容文档条目时使用）。
+// 不含 .xml：NCX / rights.xml 等非正文 XML 不能仅凭扩展名误判为正文。
 func isContentDocURI(uri string) bool {
 	if uri == "" {
 		return false
 	}
-	h := normHref(uri) // 剥 fragment + 解码 + 根化
-	ext := strings.ToLower(path.Ext(h))
-	return ext == ".xhtml" || ext == ".html" || ext == ".htm" || ext == ".xml"
+	ext := strings.ToLower(path.Ext(normHref(uri)))
+	return ext == ".xhtml" || ext == ".html" || ext == ".htm" || ext == ".xht"
 }
 
-// findOPFDir 从 META-INF/container.xml 解出 OPF 所在目录（根化，如 /OEBPS）。
-func findOPFDir(e *epub.Epub) (string, error) {
+// findOPFPath 定位 OPF（返回包根相对路径，如 "OPS/fb.opf"）。
+// 优先 container.xml 的 rootfile；缺失/损坏时退而扫描 zip 里的 .opf 条目
+// （老式包常没有 container.xml，或路径写法不规范）。
+func findOPFPath(e *epub.Epub) (string, error) {
 	for _, f := range e.File {
 		if normZipName(f.Name) != "/META-INF/container.xml" {
 			continue
 		}
 		r, err := f.Open()
 		if err != nil {
-			return "", err
+			break
 		}
-		defer r.Close()
-		b, err := io.ReadAll(r)
-		if err != nil {
-			return "", err
+		b, readErr := io.ReadAll(r)
+		r.Close()
+		if readErr == nil {
+			var c struct {
+				Rootfiles struct {
+					Rootfile []struct {
+						FullPath string `xml:"full-path,attr"`
+					} `xml:"rootfile"`
+				} `xml:"rootfiles"`
+			}
+			if xml.Unmarshal(b, &c) == nil && len(c.Rootfiles.Rootfile) > 0 {
+				if fp := strings.TrimSpace(c.Rootfiles.Rootfile[0].FullPath); fp != "" {
+					return fp, nil
+				}
+			}
 		}
-		var c struct {
-			Rootfiles struct {
-				Rootfile []struct {
-					FullPath string `xml:"full-path,attr"`
-				} `xml:"rootfile"`
-			} `xml:"rootfiles"`
-		}
-		if err := xml.Unmarshal(b, &c); err != nil || len(c.Rootfiles.Rootfile) == 0 {
-			return "", errors.New("container.xml 缺少 rootfile")
-		}
-		return path.Clean("/" + path.Dir(c.Rootfiles.Rootfile[0].FullPath)), nil
+		break
 	}
-	return "", errors.New("EPUB 缺少 META-INF/container.xml")
+	for _, f := range e.File {
+		n := normZipName(f.Name)
+		if strings.HasPrefix(strings.ToLower(n), "/meta-inf/") {
+			continue
+		}
+		if strings.EqualFold(path.Ext(n), ".opf") {
+			return strings.TrimPrefix(n, "/"), nil
+		}
+	}
+	return "", errors.New("EPUB 缺少可识别的 OPF（container.xml 与 .opf 条目都找不到）")
+}
+
+// findOPFDir 从 OPF 路径解出所在目录（根化，如 /OPS）。
+func findOPFDir(e *epub.Epub) (string, error) {
+	full, err := findOPFPath(e)
+	if err != nil {
+		return "", err
+	}
+	return path.Clean("/" + path.Dir(full)), nil
+}
+
+// looseOPF 不约束命名空间地解析 OPF。Go 的 encoding/xml 对未指定命名空间
+// 的字段标签会匹配任意命名空间的同名元素，所以 dc:title 与裸 title、
+// 带前缀/不带前缀的 manifest 都能解析。
+type looseOPF struct {
+	Metadata struct {
+		Title   []string `xml:"title"`
+		Creator []string `xml:"creator"`
+	} `xml:"metadata"`
+	Manifest struct {
+		Items []struct {
+			ID         string `xml:"id,attr"`
+			Href       string `xml:"href,attr"`
+			MediaType  string `xml:"media-type,attr"`
+			Properties string `xml:"properties,attr"`
+		} `xml:"item"`
+	} `xml:"manifest"`
+	Spine struct {
+		Toc      string `xml:"toc,attr"`
+		Itemrefs []struct {
+			IDref string `xml:"idref,attr"`
+		} `xml:"itemref"`
+	} `xml:"spine"`
+}
+
+// parseOPFLoose 构造与 pirmd 等价的 PackageDocument，并顺带返回
+// dc:title / dc:creator（失败路径下 e.Information() 同样不可用）。
+func parseOPFLoose(e *epub.Epub, opfPath string) (*epub.PackageDocument, string, string, error) {
+	raw, err := readZipItem(e, "/", opfPath)
+	if err != nil {
+		return nil, "", "", err
+	}
+	var doc looseOPF
+	if err := xml.Unmarshal([]byte(raw), &doc); err != nil {
+		return nil, "", "", err
+	}
+	if len(doc.Manifest.Items) == 0 || len(doc.Spine.Itemrefs) == 0 {
+		return nil, "", "", errors.New("OPF 缺少 manifest 或 spine")
+	}
+	opf := &epub.PackageDocument{
+		Manifest: &epub.Manifest{},
+		Spine:    &epub.Spine{},
+	}
+	for _, it := range doc.Manifest.Items {
+		opf.Manifest.Items = append(opf.Manifest.Items, epub.Item{
+			ID: it.ID, Href: it.Href, MediaType: it.MediaType, Properties: it.Properties,
+		})
+	}
+	opf.Spine.Toc = doc.Spine.Toc
+	for _, r := range doc.Spine.Itemrefs {
+		opf.Spine.Itemrefs = append(opf.Spine.Itemrefs, epub.Itemref{IDref: r.IDref})
+	}
+	title, author := "", ""
+	if len(doc.Metadata.Title) > 0 {
+		title = strings.TrimSpace(doc.Metadata.Title[0])
+	}
+	if len(doc.Metadata.Creator) > 0 {
+		author = strings.TrimSpace(doc.Metadata.Creator[0])
+	}
+	return opf, title, author, nil
 }
 
 // ---- XHTML → 纯文本 ----
@@ -284,17 +468,45 @@ var blockTags = map[string]bool{
 // htmlToText XHTML → 纯文本：块级元素换行分隔、<br> 换行、script/style/head
 // 整块跳过、img 插占位符、行内空白折叠、实体由解析器解码。
 func htmlToText(r io.Reader, imgPlaceholder string) string {
+	text, _ := htmlToTextWithAnchors(r, imgPlaceholder)
+	return text
+}
+
+// htmlToTextWithAnchors 提纯文本的同时记录 id / name → 该文档内的 rune 偏移。
+// G4（2026-11-06）：EPUB3 nav / EPUB2 NCX 的目录条目常带 #fragment，只按
+// 文件键映射会把同一章的小节条目全挤到章首。锚点记在「元素文本开始处」，
+// 口径与最终输出一致（当前行按 flush 时的折叠规则折算），调用方再加上章节
+// 在全文中的起点即可。重复 id 取第一次出现。
+func htmlToTextWithAnchors(r io.Reader, imgPlaceholder string) (string, map[string]int) {
 	doc, err := xhtml.Parse(r)
 	if err != nil {
-		return ""
+		return "", nil
 	}
+	anchors := make(map[string]int)
 	var sb strings.Builder
 	var line []rune
+	written := 0 // 已 flush 进 sb 的 rune 数
+	// curOff：若此刻把 line 冲刷出去，其在最终输出文本里的 rune 偏移。
+	curOff := func() int {
+		return written + utf8.RuneCountInString(strings.Join(strings.Fields(string(line)), " "))
+	}
+	record := func(n *xhtml.Node) {
+		for _, key := range []string{"id", "name"} {
+			id := strings.TrimSpace(attrOf(n, key))
+			if id == "" {
+				continue
+			}
+			if _, exists := anchors[id]; !exists {
+				anchors[id] = curOff()
+			}
+		}
+	}
 	flush := func() {
 		t := strings.Join(strings.Fields(string(line)), " ")
 		if t != "" {
 			sb.WriteString(t)
 			sb.WriteByte('\n')
+			written += utf8.RuneCountInString(t) + 1
 		}
 		line = line[:0]
 	}
@@ -308,11 +520,13 @@ func htmlToText(r io.Reader, imgPlaceholder string) string {
 				flush()
 				return
 			case "img", "image":
+				record(n) // 图片锚点指向 [图] 占位符之前
 				if imgPlaceholder != "" {
 					line = append(line, []rune(imgPlaceholder)...)
 				}
 				return // void 元素，无子节点
 			case "svg":
+				record(n)
 				if imgPlaceholder != "" {
 					line = append(line, []rune(imgPlaceholder)...)
 				}
@@ -322,6 +536,7 @@ func htmlToText(r io.Reader, imgPlaceholder string) string {
 			if isBlock {
 				flush()
 			}
+			record(n)
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
 				walk(c)
 			}
@@ -340,7 +555,7 @@ func htmlToText(r io.Reader, imgPlaceholder string) string {
 	}
 	walk(doc)
 	flush()
-	return sb.String()
+	return sb.String(), anchors
 }
 
 // ---- TOC 解析 ----

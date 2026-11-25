@@ -210,6 +210,7 @@ func BuildTOCFor(path string, enc encoding.Encoding, pageSize int, co CleanOptio
 	var line strings.Builder
 	lineStart := 0 // 行首原始 rune 偏移
 	raw := 0
+	pendingCR := false // 上一个字符是 \r：紧随的 \n 只更新行首，不重复冲刷
 	flush := func() {
 		txt := cleanWith(line.String(), co)
 		if rule, ok := matchChapter(txt); ok {
@@ -230,14 +231,25 @@ func BuildTOCFor(path string, enc encoding.Encoding, pageSize int, co CleanOptio
 			return nil, err
 		}
 		raw++
-		if ru == '\n' {
-			flush()
-			lineStart = raw // 下一行首原始 rune 偏移
-			continue
-		}
+		// H3（2026-11-25 审查）：\r 也是行边界。显示层 cleanWith 做 \r → \n，
+		// 这里若丢掉 \r，纯 CR / 混合换行的书会把多行并成一行，目录缺章或整本塌成
+		// 一条假标题。\r\n 的 \n 只更新行首（行已在 \r 处冲刷），保证 Windows 文本
+		// 的条目与偏移和旧版逐字节一致。
 		if ru == '\r' {
+			flush()
+			lineStart = raw
+			pendingCR = true
 			continue
 		}
+		if ru == '\n' {
+			if !pendingCR {
+				flush()
+			}
+			lineStart = raw
+			pendingCR = false
+			continue
+		}
+		pendingCR = false
 		line.WriteRune(ru)
 	}
 	flush()
@@ -250,6 +262,7 @@ func buildTOCFromText(text string, pageSize int, co CleanOptions) []TocEntry {
 	var toc []TocEntry
 	lineStart := 0 // 行首原始 rune 偏移
 	raw := 0
+	pendingCR := false
 	var line strings.Builder
 	flush := func() {
 		txt := cleanWith(line.String(), co)
@@ -264,14 +277,22 @@ func buildTOCFromText(text string, pageSize int, co CleanOptions) []TocEntry {
 	}
 	for _, ru := range text {
 		raw++
-		if ru == '\n' {
+		// H3：与 BuildTOCFor 同一口径（\r 为行边界，\r\n 不重复冲刷）。
+		if ru == '\r' {
 			flush()
 			lineStart = raw
+			pendingCR = true
 			continue
 		}
-		if ru == '\r' {
+		if ru == '\n' {
+			if !pendingCR {
+				flush()
+			}
+			lineStart = raw
+			pendingCR = false
 			continue
 		}
+		pendingCR = false
 		line.WriteRune(ru)
 	}
 	flush()
@@ -297,14 +318,72 @@ func (b *Book) SeekTo(offset int, title string) (string, int, error) {
 	// 的页号——用钳制前的 page 查 cache 必然 miss，返回整屏空白（书被外部
 	// 编辑变小 / Offset 与当前 pageSize 不符时可达）。
 	txt := b.cache[b.cur]
-	bi := strings.Index(txt, title)
-	if bi >= 0 {
-		return txt, len([]rune(txt[:bi])), nil
+	// H4（2026-11-25 审查）：offset 只用来算页号，页内定位原先靠「首次出现」，
+	// 正文里更早出现的同一串（"他数到 12 才停"）会把落点抢走。改为优先行首出现；
+	// hint 是同页内的 raw 偏移（用钳制后的 b.cur，B2 口径），用于多个行首候选间取最近。
+	if off := IndexLineHead(txt, title, offset-b.cur*b.pageSize); off >= 0 {
+		return txt, off, nil
 	}
 	if off, ok := findSplitTitle(txt, title); ok {
 		return txt, off, nil
 	}
 	return txt, 0, nil // 标题未在页内找到（极端），退化为页首
+}
+
+// IndexLineHead 在 pageText 里定位 title，优先「行首（允许前导空白）」的出现：
+// 目录条目的 Offset 指向行首，正文里的同串通常落在行中；多个行首候选时取离
+// hint 最近的一个（hint 为同坐标系的期望位置，未知传 -1）。没有行首候选时退回
+// 首次出现，保持旧口径——标题被页边界切断、md 前缀被美化剥掉等情形不受影响。
+// 找不到返回 -1。
+func IndexLineHead(pageText, title string, hint int) int {
+	if pageText == "" || title == "" {
+		return -1
+	}
+	rs := []rune(pageText)
+	best, bestDist := -1, 0
+	for from := 0; from < len(pageText); {
+		k := strings.Index(pageText[from:], title)
+		if k < 0 {
+			break
+		}
+		bytePos := from + k
+		pos := len([]rune(pageText[:bytePos]))
+		if atLineHead(rs, pos) {
+			d := 0
+			if hint >= 0 {
+				d = pos - hint
+				if d < 0 {
+					d = -d
+				}
+			}
+			if best < 0 || d < bestDist {
+				best, bestDist = pos, d
+			}
+		}
+		from = bytePos + len(title)
+	}
+	if best >= 0 {
+		return best
+	}
+	if bi := strings.Index(pageText, title); bi >= 0 { // 旧口径兜底
+		return len([]rune(pageText[:bi]))
+	}
+	return -1
+}
+
+// atLineHead 判断 pos 是否行首（只允许行首空白：半角空格 / tab / 全角空格）。
+func atLineHead(rs []rune, pos int) bool {
+	for i := pos - 1; i >= 0; i-- {
+		switch rs[i] {
+		case ' ', '\t', '\u3000':
+			continue
+		case '\n':
+			return true
+		default:
+			return false
+		}
+	}
+	return true // 页首
 }
 
 // findSplitTitle 标题被页边界切断时的落点定位：在页尾 window 个 rune 内，

@@ -80,6 +80,13 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 	if opf.Spine == nil || len(opf.Spine.Itemrefs) == 0 {
 		return nil, errors.New("EPUB 缺少 spine（无阅读顺序），无法打开")
 	}
+	// H1（2026-11-25 审查）：pirmd 的 Manifest 是 *Manifest，encoding/xml 只在元素
+	// 存在时才分配。缺 <manifest> 的畸形书此前会在下面的 len(opf.Manifest.Items)
+	// 处空指针崩溃（openAt → OpenEpub 全链路无 recover，整个进程退出）。
+	// 这里收敛成可读错误；元素存在但条目为空的情况维持原行为，不动正常书。
+	if opf.Manifest == nil {
+		return nil, errors.New("EPUB 缺少 manifest（资源清单），无法打开")
+	}
 	opfDir, err := findOPFDir(e)
 	if err != nil {
 		return nil, err
@@ -114,12 +121,16 @@ func ParseEpub(epubPath string, imgPlaceholder string) (*EpubContent, error) {
 
 	// ---- spine 顺序提取纯文本，记录每个条目的起始 rune 偏移 ----
 	ec := &EpubContent{}
-	if info, err := e.Information(); err == nil && info != nil {
-		if len(info.Title) > 0 {
-			ec.Title = strings.TrimSpace(info.Title[0])
-		}
-		if len(info.Creator) > 0 {
-			ec.Author = strings.TrimSpace(info.Creator[0].FullName)
+	// Metadata 同样是指针：元素缺失时 e.Information() → getMeta(nil) 会空指针崩溃。
+	// 书名/作者属可选信息，读不到就留着空串，由下面的 loose 兜底补；不影响正文。
+	if opf.Metadata != nil {
+		if info, err := e.Information(); err == nil && info != nil {
+			if len(info.Title) > 0 {
+				ec.Title = strings.TrimSpace(info.Title[0])
+			}
+			if len(info.Creator) > 0 {
+				ec.Author = strings.TrimSpace(info.Creator[0].FullName)
+			}
 		}
 	}
 	// 兜底路径下 pirmd 的 Information() 也会因命名空间失败，书名/作者用
@@ -302,7 +313,8 @@ func checkEncryption(e *epub.Epub, opf *epub.PackageDocument, opfDir string) err
 // media-type 可能带 "; charset=utf-8" 之类参数，取分号前的主类型。
 func manifestContentDocs(opf *epub.PackageDocument, opfDir string) map[string]bool {
 	keys := make(map[string]bool)
-	if opf == nil {
+	// Manifest 也是指针（H1）：调用方已判过，这里保底，避免函数自身成为 panic 源。
+	if opf == nil || opf.Manifest == nil {
 		return keys
 	}
 	for _, it := range opf.Manifest.Items {

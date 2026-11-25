@@ -196,13 +196,25 @@ func Open(path string) (*Book, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openWithSource(f, path)
+}
+
+// openWithSource 承接已打开的文件句柄：采样或建 Book 任一步失败都必须关掉它。
+// M6（2026-11-25 审查）：旧代码 openBook 失败直接 return，句柄悬挂；Windows 上
+// 表现为文件被占用、删不掉。
+func openWithSource(f *os.File, path string) (*Book, error) {
 	sample, err := readSample(f, 2<<20) // 采样前 2MB 用于探测编码
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
 	enc, name := chooseEncoding(sample)
-	return openBook(f, path, enc, name)
+	b, err := openBook(f, path, enc, name)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return b, nil
 }
 
 // OpenEpub 解包 EPUB 并以内存流打开：解出全文纯文本后走与 txt 完全相同的
@@ -536,6 +548,16 @@ func chooseEncoding(sample []byte) (encoding.Encoding, string) {
 		}
 	}
 	mapped := charsetToEncoding(detected)
+	// H5（2026-11-25 审查）：无 BOM UTF-16 会被 chardet 判成 windows-1252，
+	// 而 charmap 解码几乎不产生替换字符，旧逻辑必然选中它。只在「chardet 给的是
+	// 单字节字符集 + 样本含 NUL + 不是干净 UTF-8」时尝试 UTF-16：
+	// 正常 GBK / UTF-8 / Big5 / 拉丁文本都不含 NUL，一律不走进这里。
+	var utf16Enc encoding.Encoding
+	utf16Name := ""
+	if isSingleByteCharset(detected) && nulRatio(sample) >= 0.005 &&
+		(countBad(decodeSample(xunicode.UTF8, sample)) > 0 || nulRatio(sample) >= 0.2) {
+		utf16Enc, utf16Name = sniffUTF16(sample)
+	}
 	var cands []encoding.Encoding
 	add := func(e encoding.Encoding) {
 		for _, c := range cands {
@@ -544,6 +566,9 @@ func chooseEncoding(sample []byte) (encoding.Encoding, string) {
 			}
 		}
 		cands = append(cands, e)
+	}
+	if utf16Enc != nil {
+		add(utf16Enc) // 先入列：与 charmap 同为 bad=0 时由它胜出（只在本分支发生）
 	}
 	if mapped != nil {
 		add(mapped)
@@ -560,6 +585,9 @@ func chooseEncoding(sample []byte) (encoding.Encoding, string) {
 		}
 	}
 	name := detected
+	if utf16Enc != nil && best == utf16Enc {
+		name = utf16Name // 与 encCandidates 同名，编码对话框能正确回显
+	}
 	if mapped == nil {
 		if name == "" {
 			name = "未识别"
@@ -567,6 +595,117 @@ func chooseEncoding(sample []byte) (encoding.Encoding, string) {
 		name += "（按 GBK/UTF-8 容错）"
 	}
 	return best, name
+}
+
+// isSingleByteCharset 判断 chardet 给的是否单字节字符集（这类映射几乎不产生
+// 替换字符，是 H5 误判的土壤）。
+func isSingleByteCharset(name string) bool {
+	u := strings.ToUpper(name)
+	return strings.HasPrefix(u, "WINDOWS-") || strings.HasPrefix(u, "ISO-8859") ||
+		strings.HasPrefix(u, "KOI8") || u == "LATIN1"
+}
+
+// nulRatio 返回样本里 NUL 字节占比。文本文件（UTF-8/GBK/Big5 等）不含 NUL；
+// UTF-16 的换行、空格、数字高字节就是 0x00，是最可靠的容器信号。
+func nulRatio(sample []byte) float64 {
+	if len(sample) == 0 {
+		return 0
+	}
+	n := 0
+	for _, b := range sample {
+		if b == 0 {
+			n++
+		}
+	}
+	return float64(n) / float64(len(sample))
+}
+
+// sniffUTF16 用「解码结果是否像正常文本」判定无 BOM UTF-16 的字节序。
+// 只在样本含 NUL 且非干净 UTF-8 时调用，普通单字节文本不会走到这里。
+func sniffUTF16(sample []byte) (encoding.Encoding, string) {
+	if len(sample) < 8 {
+		return nil, ""
+	}
+	le := xunicode.UTF16(xunicode.LittleEndian, xunicode.IgnoreBOM)
+	be := xunicode.UTF16(xunicode.BigEndian, xunicode.IgnoreBOM)
+	type cand struct {
+		enc   encoding.Encoding
+		name  string
+		score float64
+	}
+	var ok []cand
+	for _, c := range []cand{{le, "UTF-16LE", 0}, {be, "UTF-16BE", 0}} {
+		s := decodeSample(c.enc, sample)
+		if countBad(s) > 0 {
+			continue
+		}
+		if sc := plausibleRatio(s); sc >= 0.85 {
+			c.score = sc
+			ok = append(ok, c)
+		}
+	}
+	if len(ok) == 0 {
+		return nil, ""
+	}
+	if len(ok) == 1 || ok[0].score != ok[1].score {
+		best := ok[0]
+		for _, c := range ok[1:] {
+			if c.score > best.score {
+				best = c
+			}
+		}
+		return best.enc, best.name
+	}
+	// 同分：按 NUL 奇偶位置裁决（ASCII 文本的 UTF-16 特征最明显）
+	odd, even := nulParity(sample)
+	if even > odd {
+		return be, "UTF-16BE"
+	}
+	return le, "UTF-16LE"
+}
+
+// plausibleRatio 计算解码后文本落在「常见可读区间」的比例：
+// ASCII 可打印、拉丁补充与通用标点、CJK 标点/汉字、全角、扩展 B 区。
+func plausibleRatio(s string) float64 {
+	rs := []rune(s)
+	if len(rs) == 0 {
+		return 0
+	}
+	good := 0
+	for _, r := range rs {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			good++
+		case r >= 0x20 && r <= 0x7E:
+			good++
+		case r >= 0xA0 && r <= 0x2FFF:
+			good++
+		case r >= 0x3000 && r <= 0x303F:
+			good++
+		case r >= 0x4E00 && r <= 0x9FFF:
+			good++
+		case r >= 0xFF00 && r <= 0xFFEF:
+			good++
+		case r >= 0x20000 && r <= 0x2FA1F:
+			good++
+		}
+	}
+	return float64(good) / float64(len(rs))
+}
+
+// nulParity 统计偶数位 / 奇数位上的 NUL 个数。
+func nulParity(sample []byte) (odd, even int) {
+	for i, b := range sample {
+		if b != 0 {
+			continue
+		}
+		if i%2 == 0 {
+			even++
+		} else {
+			odd++
+		}
+	}
+	return odd, even
 }
 
 func decodeSample(e encoding.Encoding, sample []byte) string {

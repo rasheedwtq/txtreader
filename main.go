@@ -60,6 +60,62 @@ var (
 	hs         *walk.Splitter
 )
 
+// ---- 会话内多本书的进度（M2，2026-11-25 审查）----
+// lastState 是单槽：A→B 时 B 的 persist 会把 A 的进度覆盖，切回 A 只能从第 0 页开。
+// 这里在换书前把离开的那本存一份（页码 + 视口锚点），切回时按同一套逻辑恢复。
+// 只存内存、不落盘：重启后仍只恢复最后落盘的那一本（与旧行为一致）；最多留
+// bookMarkMax 本，按打开顺序淘汰，防止翻目录翻出几千条。
+const bookMarkMax = 32
+
+type bookMark struct {
+	page     int
+	viewPage int
+	anchor   string
+}
+
+var (
+	bookMarks   = map[string]bookMark{}
+	bookMarkSeq []string
+)
+
+// rememberBook 记下即将关闭的书的现场。必须在 Close 之前调用：captureView
+// 依赖当前显示内容，关掉就只剩零值了。
+func rememberBook(b *reader.Book) {
+	if b == nil {
+		return
+	}
+	p := b.Path()
+	vp, va := captureView()
+	if _, ok := bookMarks[p]; !ok {
+		bookMarkSeq = append(bookMarkSeq, p)
+		for len(bookMarkSeq) > bookMarkMax {
+			delete(bookMarks, bookMarkSeq[0])
+			bookMarkSeq = bookMarkSeq[1:]
+		}
+	}
+	bookMarks[p] = bookMark{page: b.Page(), viewPage: vp, anchor: va}
+}
+
+// restorePoint 决定打开 path 时应恢复到哪：优先 lastState（最近落盘的那本），
+// 其次查会话内 bookMarks（M2）。remembered=false 表示没有可恢复的进度。
+// E4 迁移保留：旧 state 只有 page 没有 view_page 时用 page 顶上。
+func restorePoint(path string) (remembered bool, page, viewPage int, anchor string) {
+	if lastState.CurrentPath == path {
+		page, viewPage, anchor = lastState.Page, lastState.ViewPage, lastState.ViewAnchor
+		if anchor == "" && viewPage == 0 && page > 0 {
+			viewPage = page
+		}
+		return true, page, viewPage, anchor
+	}
+	if m, ok := bookMarks[path]; ok {
+		if m.anchor == "" && m.viewPage == 0 && m.page > 0 {
+			m.viewPage = m.page
+		}
+		return true, m.page, m.viewPage, m.anchor
+	}
+	return false, 0, 0, ""
+}
+
 // pyArgs 拼音转换参数（默认风格，多音字取第一个读音）。
 // Fallback 必须自定义：go-pinyin 默认忽略无拼音字符（实测 "hello.txt" 键为空、
 // "A文件"/"Z文件" 同键，排序退化），这里让非汉字原样保留，英文/数字走字母序。
@@ -280,13 +336,19 @@ func displayText(s string) string {
 }
 
 // displayRuneOffset 在显示文本里定位 title 的 rune 偏移。
-// md 美化会改变每行字符数，clean 原文偏移会错行，显示层重搜最稳。
-func displayRuneOffset(pageText, title string) int {
+// md 美化/行距会改变字符数，clean 原文偏移不能直接用，所以仍要在显示层重搜；
+// H4（2026-11-25 审查）：按 hint（SeekTo 给出的页内 clean 偏移）等比换算后，
+// 优先行首出现——正文里更早的同一串不会再把落点抢走。
+func displayRuneOffset(pageText, title string, hint int) int {
 	d := displayText(pageText)
-	if title != "" {
-		if bi := strings.Index(d, title); bi >= 0 {
-			return len([]rune(d[:bi]))
+	target := hint
+	if n := len([]rune(pageText)); n > 0 {
+		if dn := len([]rune(d)); dn > 0 {
+			target = hint * dn / n
 		}
+	}
+	if off := reader.IndexLineHead(d, title, target); off >= 0 {
+		return off
 	}
 	return 0
 }
@@ -352,6 +414,9 @@ func openAt(idx int) {
 	// openAt 兜底走同路径早退，不会误伤本次刚调度的复位）。
 	invalidateReanchor()
 	if curBook != nil {
+		// M2：换书前把离开的那本存一份（页码 + 视口锚点），切回来才能回原页。
+		// 同一路径重开在上面的早退分支已经挡掉，这里不必再判。
+		rememberBook(curBook)
 		curBook.Close()
 		curBook = nil
 	}
@@ -375,20 +440,9 @@ func openAt(idx int) {
 	// 时序陷阱（现场 bug 2026-10-22）：showCurrent 内部会 persist 并刷新
 	// lastState（此刻视口在文档顶部），锚点必须在 showCurrent **之前**快照，
 	// 否则搜的是被覆盖后的"第一行"，永远滚回文档开头。
-	remembered := lastState.CurrentPath == curEntries[idx].path
-	var restorePage int
-	var restoreAnchor string
-	if remembered {
-		restorePage = lastState.ViewPage
-		restoreAnchor = lastState.ViewAnchor
-		// E4（2026-10-23 审查）：旧口径 state.json 只有 page 没有 view_page，
-		// 缺迁移会把老进度整本作废（条件命中但 Goto(0)）。
-		if restoreAnchor == "" && lastState.ViewPage == 0 && lastState.Page > 0 {
-			restorePage = lastState.Page
-		}
-		if lastState.Page > 0 || restoreAnchor != "" {
-			_ = b.Goto(restorePage) // ViewPage==0（短篇单页）即第 0 页，合法
-		}
+	remembered, rawPage, restorePage, restoreAnchor := restorePoint(curEntries[idx].path)
+	if remembered && (rawPage > 0 || restoreAnchor != "") {
+		_ = b.Goto(restorePage) // ViewPage==0（短篇单页）即第 0 页，合法
 	}
 	showCurrent()
 	if remembered && restoreAnchor != "" && te != nil {
@@ -546,6 +600,15 @@ func persistWithAnchor(anchor string) {
 		if anchor != "" {
 			st.ViewAnchor = anchor
 		}
+	} else {
+		// H2（2026-11-25 审查）：打开失败时 openAt 已把 curBook 置 nil，旧逻辑从零值
+		// 写整份 state，会把"上次在读哪本、第几页"一起抹掉（下次启动只剩目录第一本）。
+		// 这里沿用上一份快照的四个进度字段；目录/字体/清洗/窗口仍按当前值写。
+		// 首次运行 lastState 为零值，行为与旧版一致。
+		st.CurrentPath = lastState.CurrentPath
+		st.Page = lastState.Page
+		st.ViewPage = lastState.ViewPage
+		st.ViewAnchor = lastState.ViewAnchor
 	}
 	if mw != nil { // 测试环境可能无主窗（全局 mw 被 makeTestWindow 遮蔽）
 		saveWindowRect(&st)
@@ -601,10 +664,14 @@ func restoreWindowRect(st appState) {
 	if !winRectVisible(st.WinX, st.WinY, st.WinW, st.WinH) {
 		return // 坐标落在现有显示器之外，放弃恢复用默认值
 	}
-	_ = mw.SetX(st.WinX)
-	_ = mw.SetY(st.WinY)
-	_ = mw.SetWidth(st.WinW)
-	_ = mw.SetHeight(st.WinH)
+	// H6（2026-11-25 审查）：GetWindowPlacement 存的是物理像素（app.manifest
+	// 声明 permonitorv2，不做虚拟化），walk 的 SetX/SetY/SetWidth/SetHeight 却是
+	// DIP 口径（内部再乘 DPI 系数）。必须用 *Pixels 一套，否则非 100% 缩放下
+	// 每启动一次窗口就放大一档，最终被 winRectVisible 判定为不可见而放弃恢复。
+	_ = mw.SetXPixels(st.WinX)
+	_ = mw.SetYPixels(st.WinY)
+	_ = mw.SetWidthPixels(st.WinW)
+	_ = mw.SetHeightPixels(st.WinH)
 	if st.WinMax {
 		win.ShowWindow(mw.Handle(), win.SW_MAXIMIZE)
 	}
@@ -1157,7 +1224,7 @@ func tocJump() {
 	}
 	e := curTOC[idx]
 	invalidateReanchor()
-	text, _, err := curBook.SeekTo(e.Offset, e.Title)
+	text, off, err := curBook.SeekTo(e.Offset, e.Title)
 	if err != nil {
 		return
 	}
@@ -1168,8 +1235,9 @@ func tocJump() {
 	accumBuf = []string{text}
 	dispStale = true
 	render(text)
-	// 美化会改变每行字符数，在显示文本里重搜标题位置，避免错行
-	scrollCaretToTop(displayText(text), displayRuneOffset(text, e.Title))
+	// 美化会改变每行字符数，在显示文本里重搜标题位置，避免错行；
+	// hint 用 SeekTo 的落点，多个同名行首候选时才不会挑错。
+	scrollCaretToTop(displayText(text), displayRuneOffset(text, e.Title, off))
 	if folderLbl != nil {
 		base := filepath.Dir(curBook.Path())
 		folderLbl.SetText(fmt.Sprintf("文件夹：%s（%d 篇）   当前编码：%s", base, len(curEntries), curBook.EncName()))
